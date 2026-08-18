@@ -1,0 +1,73 @@
+{
+  "landsat_full": {
+    "desc": "Landsat 5/7/8/9 surface reflectance (DEA ARD), 30m",
+    "code": "landsat_full",
+    "sensor_label": "Landsat",
+    "source": "DEA",
+    "collections": ["ga_ls5t_ard_3", "ga_ls7e_ard_3", "ga_ls8c_ard_3", "ga_ls9c_ard_3"],
+    "resolution": 30,
+    "nodata": -1,
+    "bands_to_include": [
+      "nbart_blue",
+      "nbart_green",
+      "nbart_red",
+      "nbart_nir",
+      "nbart_swir_1",
+      "nbart_swir_2",
+      "oa_fmask"
+    ],
+    "bands_to_resample": "nearest",
+    "bands_to_sharpen": "nil",
+    "process": "make_multiband",
+    "description": "Full Landsat 5/7/8/9 archive.",
+    "dtype": "int32",
+    "canonical_bands": {
+      "blue": "nbart_blue",
+      "green": "nbart_green",
+      "red": "nbart_red",
+      "nir": "nbart_nir",
+      "swir1": "nbart_swir_1",
+      "swir2": "nbart_swir_2",
+      "fmask": "oa_fmask"
+    }
+  },
+  "sentinel_full": {
+    "desc": "Sentinel-2 bands (DEA ARD), resampled to 10m using HPF sharpening",
+    "code": "sentinel_full",
+    "sensor_label": "Sentinel-2",
+    "source": "DEA",
+    "collections": ["ga_s2am_ard_3", "ga_s2bm_ard_3", "ga_s2cm_ard_3"],
+    "resolution": 10,
+    "nodata": -1,
+    "bands_to_include": [
+      "nbart_blue",
+      "nbart_green",
+      "nbart_red",
+      "nbart_nir_1",
+      "nbart_swir_2",
+      "nbart_swir_3",
+      "oa_fmask"
+    ],
+    "bands_to_resample": {
+      "nbart_swir_2": "bilinear",
+      "nbart_swir_3": "bilinear",
+      "oa_fmask": "nearest"
+    },
+    "bands_to_sharpen": {
+      "nbart_swir_2": {"ref": "nbart_nir_1", "method": "hpf"},
+      "nbart_swir_3": {"ref": "nbart_nir_1", "method": "hpf"}
+    },
+    "process": "make_multiband",
+    "description": "Sentinel-2 archive.",
+    "dtype": "int32",
+    "canonical_bands": {
+      "blue": "nbart_blue",
+      "green": "nbart_green",
+      "red": "nbart_red",
+      "nir": "nbart_nir_1",
+      "swir1": "nbart_swir_2",
+      "swir2": "nbart_swir_3",
+      "fmask": "oa_fmask"
+    }
+  }
+}
