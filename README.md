@@ -1,9 +1,9 @@
 # Peatland Trend Analysis
 
-A Streamlit app for analysing long-term trends in Victorian alpine bogs and
-Snowy Mountains (NSW) bogs/fens, using Landsat and Sentinel-2 surface
-reflectance from Digital Earth Australia (DEA). Pick a polygon on a map,
-choose a date range and sensor(s), fetch, then interactively filter,
+A Streamlit app for analysing long-term trends in Victorian alpine peatlands
+and Snowy Mountains (NSW) peatlands/fens, using Landsat and Sentinel-2
+surface reflectance from Digital Earth Australia (DEA). Pick a polygon on
+a map, choose a date range and sensor(s), fetch, then interactively filter,
 trend-plot, spot-check and export.
 
 It's a Python/Streamlit rebuild of an original R Shiny app, fetching data
@@ -131,7 +131,7 @@ in more detail.
 DEA's `eo:cloud_cover` (tab 2's "maximum whole-tile cloud cover" slider) is
 computed over the *entire satellite tile* - well over 100km across for
 Landsat - not just your polygon. A tile can easily have some cloud on the
-other side of that huge area while your bog itself is perfectly clear, so
+other side of that huge area while your peatland itself is perfectly clear, so
 requiring 0% often matches nothing. That slider is really just a
 fetch-volume limiter; the filter that actually reflects cloud over your
 polygon is tab 3's "maximum scene cloud cover over polygon" slider, which
@@ -207,7 +207,7 @@ session, either, only per run.
 - **How big, really.** Tab 2's summary panel reports the actual measured
   size of `AnalysisResult.scene_cache` (via `analysis.cache_size_bytes()`,
   real `numpy.nbytes`, not an estimate) for the run you just did. For a
-  typical small bog/fen polygon (tens to a few hundred pixels), even a
+  typical small peatland/fen polygon (tens to a few hundred pixels), even a
   full 40-year, thousand-scene run lands in the single-digit megabytes - a
   500-scene/400-pixel run measured around 3 MB with this cache design. It
   scales with polygon size x scene count, so a much larger polygon or a
@@ -336,7 +336,7 @@ these specific sites - use tab 3's single-scene true-colour viewer to
 sanity-check any scene the smoke filter flags before trusting it, and
 adjust tab 2's sensitivity threshold accordingly.
 
-**All-touched pixel rasterisation.** Many of these bog/fen polygons are
+**All-touched pixel rasterisation.** Many of these peatland/fen polygons are
 tiny - the smallest Snowy Mountains fens are ~0.007 ha, well under a single
 Landsat pixel (0.09 ha). The polygon-to-grid mask is rasterised with
 `all_touched=True` (any pixel the polygon boundary touches counts), not
