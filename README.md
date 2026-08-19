@@ -101,6 +101,14 @@ in more detail.
      outline over the top, with an option to hide it) or **exclude/
      re-include** the selected scene(s) from the analysis. This viewer sits
      between the time-series and phenology plots.
+   - **Snow cover over time**: a simple scatter of each fetched scene's
+     snow cover over the polygon (no error bars - it's a single percentage,
+     not an index) - click, box-select or lasso-select points here the same
+     way as the time series, to add scenes to the viewer or exclude them.
+     Unlike every other plot in tab 3, this one shows *every* fetched scene
+     regardless of the quality filters above, since a heavily snow-covered
+     scene has no valid pixels to plot an NDVI/tasselled-cap value for and
+     would otherwise never appear anywhere to be inspected.
    - **Phenology plot**: every scene's value by month across all years,
      ordered July -> June (a water/growing year) rather than calendar
      Jan -> Dec, so the Southern Hemisphere's summer growing season stays

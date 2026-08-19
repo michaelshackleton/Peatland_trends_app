@@ -126,6 +126,72 @@ def build_categorical_color_map(values) -> dict:
     return {v: palette[i % len(palette)] for i, v in enumerate(uniq)}
 
 
+def render_scene_selection_actions(sel_scenes: list, result, key_prefix: str) -> None:
+    """Renders the "N scene(s) selected" summary plus "Add to viewer" /
+    "Exclude/re-include" buttons for a list of selected scenes (dicts with
+    item_id/product/date/sensor keys, as produced from a Plotly click/box/
+    lasso selection's customdata). Shared by every tab 3 chart that lets
+    you select scenes this way (the metric time series, the snow-cover
+    plot) so they behave identically. `key_prefix` must be unique per call
+    site so each chart's buttons get distinct Streamlit widget keys."""
+    if not sel_scenes:
+        return
+    st.markdown(
+        f"**{len(sel_scenes)} scene(s) selected:** "
+        + ", ".join(f"{d['sensor']} {d['date']}" for d in sel_scenes[:10])
+        + (" ..." if len(sel_scenes) > 10 else "")
+    )
+    bcol1, bcol2 = st.columns(2)
+    with bcol1:
+        view_label = f"Add selected scene(s) to viewer (up to {MAX_VIEWED_SCENES} at once)"
+        if st.button(view_label, key=f"{key_prefix}_add_to_viewer"):
+            viewed_keys = {v["key"] for v in st.session_state.viewed_scenes}
+            to_fetch = [
+                d for d in sel_scenes
+                if analysis.scene_key(d["product"], d["item_id"]) not in viewed_keys
+            ]
+            n_dupe = len(sel_scenes) - len(to_fetch)
+            n_slots_left = max(MAX_VIEWED_SCENES - len(st.session_state.viewed_scenes), 0)
+            n_over_cap = max(len(to_fetch) - n_slots_left, 0)
+            to_fetch = to_fetch[:n_slots_left]
+
+            n_fetched, fetch_errors = 0, []
+            for d in to_fetch:
+                key = analysis.scene_key(d["product"], d["item_id"])
+                try:
+                    with st.spinner(f"Fetching {d['sensor']} {d['date']}..."):
+                        data = analysis.fetch_single_scene(result, d["product"], d["item_id"])
+                    st.session_state.viewed_scenes.append(
+                        dict(key=key, sensor=d["sensor"], date=d["date"], data=data)
+                    )
+                    n_fetched += 1
+                except Exception as e:
+                    fetch_errors.append(f"{d['sensor']} {d['date']}: {e}")
+
+            if n_over_cap:
+                st.warning(
+                    f"The viewer already holds {MAX_VIEWED_SCENES} scenes (its max) - "
+                    f"{n_over_cap} of the selected scene(s) weren't added. Remove one "
+                    "below first to make room."
+                )
+            if n_dupe:
+                st.caption(f"{n_dupe} selected scene(s) were already in the viewer.")
+            for msg in fetch_errors:
+                st.error(f"Could not fetch {msg}")
+            if n_fetched:
+                st.rerun()
+    with bcol2:
+        sel_keys = {analysis.scene_key(d["product"], d["item_id"]) for d in sel_scenes}
+        all_excluded = sel_keys.issubset(st.session_state.excluded_keys)
+        label = "Re-include selected scene(s)" if all_excluded else "Exclude selected scene(s)"
+        if st.button(label, key=f"{key_prefix}_exclude_toggle"):
+            if all_excluded:
+                st.session_state.excluded_keys -= sel_keys
+            else:
+                st.session_state.excluded_keys |= sel_keys
+            st.rerun()
+
+
 st.set_page_config(page_title="Peatland Trend Analysis", layout="wide")
 
 
@@ -893,61 +959,79 @@ with tab_results:
                 if cd and len(cd) >= 4:
                     sel_scenes.append(dict(item_id=cd[0], product=cd[1], date=cd[2], sensor=cd[3]))
 
-            if sel_scenes:
-                st.markdown(
-                    f"**{len(sel_scenes)} scene(s) selected:** "
-                    + ", ".join(f"{d['sensor']} {d['date']}" for d in sel_scenes[:10])
-                    + (" ..." if len(sel_scenes) > 10 else "")
+            render_scene_selection_actions(sel_scenes, result, key_prefix="ts")
+
+        # ---- Snow cover over time --------------------------------------------
+        # Deliberately NOT built from `kept_df` - the quality filters above
+        # (particularly "minimum valid pixels") hard-drop any scene with zero
+        # valid (non-cloud/shadow/snow) pixels, which is exactly the kind of
+        # scene someone most often wants to inspect here (e.g. to confirm a
+        # scene really is snow-covered, rather than something having gone
+        # wrong upstream). This plots snow_pct for every fetched scene,
+        # respecting only manual excludes and the month filter above - not
+        # the valid-pixel/snow/cloud/smoke thresholds - so any fetched scene
+        # can be selected and added to the scene viewer regardless of whether
+        # it passes those thresholds. No trend lines or error bars: this is a
+        # diagnostic scatter of a single per-scene percentage, not an index.
+        st.divider()
+        st.subheader("Snow cover over time")
+        st.caption(
+            "Every fetched scene's snow cover over the polygon, including scenes with too few "
+            "valid pixels to appear in the plot above - useful for spot-checking or viewing "
+            "heavily snow-covered scenes directly, since NDVI/tasselled-cap values can't be "
+            "computed for those."
+        )
+        snow_all = result.scene_df.copy()
+        snow_all["datetime"] = pd.to_datetime(snow_all["datetime"])
+        snow_all["month"] = snow_all["datetime"].dt.month
+        snow_keys = snow_all["product"] + "::" + snow_all["item_id"].astype(str)
+        snow_all = snow_all[~snow_keys.isin(st.session_state.excluded_keys)]
+
+        if not month_choice:
+            st.info("Select at least one month above.")
+            snow_ts = snow_all.iloc[0:0]
+        else:
+            snow_ts = snow_all[snow_all["month"].isin(month_choice)]
+
+        if len(snow_ts) == 0:
+            st.info("No scenes fall in the selected month(s), or all have been excluded.")
+        else:
+            fig_snow = go.Figure()
+            has_multi_sensor_snow = snow_ts["sensor"].nunique() > 1
+            for mo in sorted(snow_ts["month"].unique()):
+                sub = snow_ts[snow_ts["month"] == mo].sort_values("datetime")
+                symbols = [SENSOR_SYMBOLS.get(s, "circle") for s in sub["sensor"]]
+                fig_snow.add_trace(
+                    go.Scatter(
+                        x=sub["datetime"], y=sub["snow_pct"],
+                        mode="markers", name=calendar.month_name[mo],
+                        marker=dict(size=8, color=MONTH_COLORS[mo], symbol=symbols,
+                                    line=dict(width=1, color="rgba(0,0,0,0.4)")),
+                        customdata=sub[["item_id", "product", "date", "sensor"]].values,
+                        hovertemplate="%{customdata[3]} %{customdata[2]}<br>Snow cover: %{y:.1f}%<extra></extra>",
+                    )
                 )
-                bcol1, bcol2 = st.columns(2)
-                with bcol1:
-                    view_label = f"Add selected scene(s) to viewer (up to {MAX_VIEWED_SCENES} at once)"
-                    if st.button(view_label):
-                        viewed_keys = {v["key"] for v in st.session_state.viewed_scenes}
-                        to_fetch = [
-                            d for d in sel_scenes
-                            if analysis.scene_key(d["product"], d["item_id"]) not in viewed_keys
-                        ]
-                        n_dupe = len(sel_scenes) - len(to_fetch)
-                        n_slots_left = max(MAX_VIEWED_SCENES - len(st.session_state.viewed_scenes), 0)
-                        n_over_cap = max(len(to_fetch) - n_slots_left, 0)
-                        to_fetch = to_fetch[:n_slots_left]
+            if has_multi_sensor_snow:
+                st.caption("Marker shape: ● Landsat, ◆ Sentinel-2. Colour = month.")
+            fig_snow.update_layout(
+                yaxis_title="Snow cover over polygon (%)", xaxis_title="Date",
+                yaxis_range=[-3, 103], height=420, legend_title="Month",
+            )
+            snow_event = st.plotly_chart(
+                fig_snow, use_container_width=True, on_select="rerun",
+                selection_mode=("points", "box", "lasso"), key="snow_chart",
+            )
 
-                        n_fetched, fetch_errors = 0, []
-                        for d in to_fetch:
-                            key = analysis.scene_key(d["product"], d["item_id"])
-                            try:
-                                with st.spinner(f"Fetching {d['sensor']} {d['date']}..."):
-                                    data = analysis.fetch_single_scene(result, d["product"], d["item_id"])
-                                st.session_state.viewed_scenes.append(
-                                    dict(key=key, sensor=d["sensor"], date=d["date"], data=data)
-                                )
-                                n_fetched += 1
-                            except Exception as e:
-                                fetch_errors.append(f"{d['sensor']} {d['date']}: {e}")
+            snow_sel_points = []
+            if snow_event and snow_event.get("selection"):
+                snow_sel_points = snow_event["selection"].get("points", [])
+            snow_sel_scenes = []
+            for pt in snow_sel_points:
+                cd = pt.get("customdata")
+                if cd and len(cd) >= 4:
+                    snow_sel_scenes.append(dict(item_id=cd[0], product=cd[1], date=cd[2], sensor=cd[3]))
 
-                        if n_over_cap:
-                            st.warning(
-                                f"The viewer already holds {MAX_VIEWED_SCENES} scenes (its max) - "
-                                f"{n_over_cap} of the selected scene(s) weren't added. Remove one "
-                                "below first to make room."
-                            )
-                        if n_dupe:
-                            st.caption(f"{n_dupe} selected scene(s) were already in the viewer.")
-                        for msg in fetch_errors:
-                            st.error(f"Could not fetch {msg}")
-                        if n_fetched:
-                            st.rerun()
-                with bcol2:
-                    sel_keys = {analysis.scene_key(d["product"], d["item_id"]) for d in sel_scenes}
-                    all_excluded = sel_keys.issubset(st.session_state.excluded_keys)
-                    label = "Re-include selected scene(s)" if all_excluded else "Exclude selected scene(s)"
-                    if st.button(label):
-                        if all_excluded:
-                            st.session_state.excluded_keys -= sel_keys
-                        else:
-                            st.session_state.excluded_keys |= sel_keys
-                        st.rerun()
+            render_scene_selection_actions(snow_sel_scenes, result, key_prefix="snow")
 
         # ---- Multi-scene raster viewer ---------------------------------------
         # Up to MAX_VIEWED_SCENES scenes' rasters in memory here at once -
