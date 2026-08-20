@@ -18,6 +18,14 @@ Landsat-vs-Sentinel time series is more useful for trend continuity than
 using two different coefficient sets that aren't directly comparable).
 
 NDVI = (nir - red) / (nir + red)
+
+NDSI (Normalized Difference Snow Index) = (green - swir1) / (green + swir1)
+is computed separately by `compute_ndsi()` below, not by `compute_indices()`
+- unlike the other four metrics, it needs its own, broader per-pixel
+validity mask (one that doesn't exclude fmask's snow class, since the whole
+point of NDSI here is to reveal snow-covered scenes the vegetation-index
+mask would otherwise hide), so it takes its own `bands` dict built from
+that separate mask. See `analysis.py`'s NDSI_VALID_FMASK_CLASSES.
 """
 
 from __future__ import annotations
@@ -31,14 +39,16 @@ TC_GREENNESS = np.array([-0.1603, -0.2819, -0.4934, 0.7940, -0.0002, -0.1446])
 TC_WETNESS = np.array([0.0315, 0.2021, 0.3102, 0.1594, -0.6806, -0.6109])
 
 REQUIRED_BANDS = ["blue", "green", "red", "nir", "swir1", "swir2"]
+NDSI_REQUIRED_BANDS = ["green", "swir1"]
 
-METRICS = ["NDVI", "TCB", "TCG", "TCW"]
+METRICS = ["NDVI", "TCB", "TCG", "TCW", "NDSI"]
 
 METRIC_LABELS = {
     "NDVI": "NDVI (vegetation index)",
     "TCB": "Tasselled Cap Brightness",
     "TCG": "Tasselled Cap Greenness",
     "TCW": "Tasselled Cap Wetness",
+    "NDSI": "NDSI (snow index)",
 }
 
 
@@ -68,3 +78,20 @@ def compute_indices(bands: dict) -> dict:
         "TCG": _tc(bands, TC_GREENNESS),
         "TCW": _tc(bands, TC_WETNESS),
     }
+
+
+def compute_ndsi(bands: dict) -> np.ndarray:
+    """`bands` is a dict of canonical band name -> 2D float array of surface
+    reflectance (0-1 fraction, NaN where invalid/masked), with at least
+    "green" and "swir1". Returns NDSI = (green - swir1) / (green + swir1) as
+    a 2D float32 array. Deliberately separate from `compute_indices()` -
+    see this module's docstring for why NDSI needs its own validity mask
+    rather than sharing the vegetation-index one."""
+    missing = [b for b in NDSI_REQUIRED_BANDS if b not in bands]
+    if missing:
+        raise ValueError(f"compute_ndsi: missing required band(s): {missing}")
+
+    green, swir1 = bands["green"], bands["swir1"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ndsi = (green - swir1) / (green + swir1)
+    return ndsi.astype("float32")

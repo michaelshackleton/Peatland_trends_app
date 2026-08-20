@@ -144,13 +144,27 @@ def reproject_multiband_to_wgs84(arr_hwc: np.ndarray, transform, crs):
 
 
 def rgb_to_png_data_uri(
-    rgb_raw: np.ndarray, opacity: float = 1.0, low_pct: float = 2.0, high_pct: float = 98.0
+    rgb_raw: np.ndarray, opacity: float = 1.0, low_pct: float = 2.0, high_pct: float = 98.0,
+    gamma: float = 1.8,
 ) -> str:
     """Percentile-stretches a raw (h, w, 3) red/green/blue DN array (NaN =
     outside the polygon / no data) per band into an 8-bit true-colour PNG
     data URI. Each band is stretched independently using only its own
     finite values, so this works whether `rgb_raw` has already been
-    reprojected (still float, still NaN outside the polygon) or not."""
+    reprojected (still float, still NaN outside the polygon) or not.
+
+    `gamma` is applied after the linear percentile stretch, as
+    `out ** (1/gamma)` - this brightens shadows/midtones without moving the
+    black/white points (0 stays 0, 1 stays 1 either way). It matters
+    because the 2nd-98th percentile clip is set by whatever's brightest/
+    darkest in the *whole* buffered view, not just the polygon: a scene
+    with a modest amount of snow (bright) surrounded by a much larger area
+    of dense/shadowed vegetation (dark) pulls the upper clip point up,
+    which linearly compresses that larger dark area down towards black
+    with very little visible tonal separation. gamma=1.0 leaves the plain
+    linear stretch as-is; higher values (this defaults to 1.8) lift that
+    dark majority back into a visible range without touching how bright
+    snow/highlights already look."""
     h, w, _ = rgb_raw.shape
     out = np.zeros((h, w, 3), dtype="float32")
     for b in range(3):
@@ -161,7 +175,10 @@ def rgb_to_png_data_uri(
         lo, hi = np.percentile(finite, [low_pct, high_pct])
         if hi <= lo:
             hi = lo + 1.0
-        out[..., b] = np.clip((band - lo) / (hi - lo), 0.0, 1.0)
+        stretched = np.clip((band - lo) / (hi - lo), 0.0, 1.0)
+        if gamma and gamma != 1.0:
+            stretched = np.power(stretched, 1.0 / gamma)
+        out[..., b] = stretched
     alpha = np.where(np.all(np.isfinite(rgb_raw), axis=-1), opacity, 0.0)
     rgba = np.concatenate([out, alpha[..., None]], axis=-1)
     rgba = np.nan_to_num(rgba, nan=0.0)
@@ -174,7 +191,8 @@ def rgb_to_png_data_uri(
 
 
 def rgb_overlay_layer(
-    rgb_raw: np.ndarray, transform, crs, low_pct: float = 2.0, high_pct: float = 98.0, opacity: float = 1.0
+    rgb_raw: np.ndarray, transform, crs, low_pct: float = 2.0, high_pct: float = 98.0, opacity: float = 1.0,
+    gamma: float = 1.8,
 ):
     """Builds a true-colour PNG overlay + bounds for a single scene's raw
     (h, w, 3) red/green/blue array, for display on a folium satellite map
@@ -182,9 +200,9 @@ def rgb_overlay_layer(
     None if there's nothing finite to show at all.
 
     `opacity` (0-1) - see raster_overlay_layer's docstring for why this is
-    exposed here too."""
+    exposed here too. `gamma` - see `rgb_to_png_data_uri()`'s docstring."""
     if not np.any(np.isfinite(rgb_raw)):
         return None
     dst_rgb, bounds = reproject_multiband_to_wgs84(rgb_raw, transform, crs)
-    data_uri = rgb_to_png_data_uri(dst_rgb, opacity=opacity, low_pct=low_pct, high_pct=high_pct)
+    data_uri = rgb_to_png_data_uri(dst_rgb, opacity=opacity, low_pct=low_pct, high_pct=high_pct, gamma=gamma)
     return data_uri, bounds

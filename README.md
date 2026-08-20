@@ -36,8 +36,8 @@ or credential is needed anywhere in this pipeline.
 The app opens on a **Home** tab with a plain-language overview of what it
 does and a short walkthrough of each numbered tab, plus a "Good to know"
 section covering the gotchas below (cloud cover, smoke detection, the
-water-year phenology axis, the TCW zero line, NDVI's fixed legend, and the
-scene viewer's 5-scene cap) - worth reading before your first run,
+water-year phenology axis, the TCW zero line, NDVI/NDSI's fixed legend, and
+the scene viewer's 5-scene cap) - worth reading before your first run,
 otherwise everything past this point in the README covers the same ground
 in more detail.
 
@@ -57,13 +57,14 @@ in more detail.
      `eo:cloud_cover`, computed over the entire 100km+ tile, not your
      polygon - see "Why does 0% cloud return nothing?" below), a minimum
      tile-coverage percentage (only scenes whose tile fully/mostly overlaps
-     the polygon are fetched at all), a smoke/haze detection sensitivity,
-     and a batch size (scenes fetched at a time - keeps memory bounded on
-     long date ranges or a server with limited RAM). A long date range is
-     also searched a few years at a time and automatically retried if DEA's
-     STAC gateway returns a transient error (occasionally a 502/503/504
-     under load) - see "What if the run fails with a STAC/gateway error?"
-     below.
+     the polygon are fetched at all), a smoke/haze detection sensitivity, an
+     NDSI snow threshold (default 0.4, the standard MODIS convention - see
+     "Which snow detection method should I use?" below), and a batch size
+     (scenes fetched at a time - keeps memory bounded on long date ranges or
+     a server with limited RAM). A long date range is also searched a few
+     years at a time and automatically retried if DEA's STAC gateway
+     returns a transient error (occasionally a 502/503/504 under load) -
+     see "What if the run fails with a STAC/gateway error?" below.
    - **Run analysis.** A progress bar tracks each sensor's batches. This is
      the only step that talks to DEA - everything in tab 3 works instantly
      from what gets cached here, with no further fetching. The summary
@@ -73,18 +74,28 @@ in more detail.
 3. **Tab 3 - Results.** Everything here is *live* - change a filter, click
    a checkbox, exclude a scene, and the raster/plots update immediately,
    no re-fetch:
-   - **Data quality filters**: minimum valid-pixel %, maximum snow %,
-     maximum cloud % (this one computed over the polygon itself, unlike
-     tab 2's whole-tile version), and maximum smoke/haze % - all applied
-     together to decide which fetched scenes count toward the raster and
-     plots below. Every fetched scene still shows in the data table
-     regardless.
+   - **Metric**, chosen first since it affects how the filters below behave:
+     NDVI, the three Tasselled Cap bands, or **NDSI** (a snow index, not a
+     vegetation one - see "Which snow detection method should I use?"
+     below). Selecting NDSI here is how you see snow cover as a proper
+     mean ± SD time series/raster, including for scenes that are too
+     snow-covered to have any NDVI/tasselled-cap value at all.
+   - **Data quality filters**: minimum valid-pixel %, maximum snow % (with
+     a choice of *snow detection method* - fmask, NDSI, or a mixture of
+     both, see below), maximum cloud % (this one computed over the polygon
+     itself, unlike tab 2's whole-tile version), and maximum smoke/haze % -
+     all applied together to decide which fetched scenes count toward the
+     raster and plots below. When NDSI is the selected metric, the
+     minimum-valid-pixel gate uses NDSI's own (snow-inclusive) valid-pixel
+     count instead of the vegetation-index one, so heavily snow-covered
+     scenes the other metrics exclude can still show up here. Every fetched
+     scene still shows in the data table regardless.
    - **Pixel-mean raster**, draped over satellite imagery with the
      polygon's outline on top (dashed white), per sensor, with a GeoTIFF
-     download button. NDVI's legend is fixed to its canonical -1 to 1
-     range rather than autoscaling to the data, so colour is comparable
-     across runs/polygons; the other metrics still autoscale to their own
-     min/max since they don't have an equivalent fixed range.
+     download button. NDVI and NDSI's legends are fixed to their canonical
+     -1 to 1 range rather than autoscaling to the data, so colour is
+     comparable across runs/polygons; the other metrics still autoscale to
+     their own min/max since they don't have an equivalent fixed range.
    - **Time series**: mean ± SD error bars, one marker per scene, coloured
      by calendar month (● = Landsat, ◆ = Sentinel-2), with a month filter
      and independent linear-trend / GAM-smoothed-trend toggles (for
@@ -92,47 +103,68 @@ in more detail.
      rough threshold above which open water is typically present). Click,
      box-select or lasso-select points to select scenes, then either
      **add them to the scene viewer** (fetches each from DEA on demand,
-     cropped to a square 200 m beyond the polygon on every side for
-     landscape context rather than just the polygon's own tight bounding
-     box; up to 5 scenes at a time, layered on one map - toggle individual
-     scenes via the layer control or remove them below, adjust raster
-     visibility/opacity, show true colour or the current metric, and
-     download any of them as a GeoTIFF - the polygon is drawn as a dashed
-     outline over the top, with an option to hide it) or **exclude/
-     re-include** the selected scene(s) from the analysis. This viewer sits
-     between the time-series and phenology plots.
-   - **Snow cover over time**: a simple scatter of each fetched scene's
-     snow cover over the polygon (no error bars - it's a single percentage,
-     not an index) - click, box-select or lasso-select points here the same
-     way as the time series, to add scenes to the viewer or exclude them.
-     Unlike every other plot in tab 3, this one shows *every* fetched scene
-     regardless of the quality filters above, since a heavily snow-covered
-     scene has no valid pixels to plot an NDVI/tasselled-cap value for and
-     would otherwise never appear anywhere to be inspected.
+     cropped to a square roughly 2km x 2km for landscape context - or, for
+     a polygon already bigger than that, a 200 m buffer beyond the polygon
+     on every side, same as before - rather than just the polygon's own
+     tight bounding box; up to 5 scenes at a time, layered on one map -
+     toggle individual scenes via the layer control or remove them below,
+     adjust raster visibility/opacity, show true colour or the current
+     metric, and download any of them as a GeoTIFF - the polygon is drawn
+     as a dashed outline over the top, with an option to hide it) or
+     **exclude/re-include** the selected scene(s) from the analysis. When
+     showing a metric layer, every loaded scene shares one colour scale and
+     legend (computed across all of them together, not autoscaled per
+     scene) so the scenes are directly comparable, rather than a separate
+     legend per scene. This viewer sits between the time-series and
+     phenology plots.
    - **Phenology plot**: every scene's value by month across all years,
      ordered July -> June (a water/growing year) rather than calendar
      Jan -> Dec, so the Southern Hemisphere's summer growing season stays
      together in one block instead of being split across the axis ends -
-     with the same trend toggles (and the same TCW zero line) as the time
-     series; the linear trend additionally prints its slope on the plot.
+     except when NDSI is the selected metric, where the axis instead runs
+     plain calendar Jan -> Dec, since that's what keeps the alpine snow
+     season (roughly June-October) contiguous rather than the water-year
+     ordering splitting it across both ends. A **"Years to include"**
+     multiselect lets you drop individual years from the plot entirely
+     (defaults to every year present). Points can be **coloured by sensor
+     or by year** (year uses a continuous colour scale - a Viridis ramp
+     sampled across the selected years - so any number of years gets a
+     distinct, order-meaningful colour rather than a fixed palette
+     repeating). The same linear/GAM trend toggles as the time series are
+     here too, plus a **"Fit trend"** choice once either is on: *Combined*
+     pools every selected year's points into one trend line (the seasonal
+     pattern averaged across them, same as before, with its slope printed
+     on the plot for the linear case), or *Separate per year* fits and
+     draws one trend line per year instead - colour-matched to that year -
+     so you can compare how the seasonal pattern itself has shifted from
+     year to year. Same TCW zero line as the time series either way.
    - **Per-scene data table**, with an editable "excluded" checkbox column
      (an alternative to excluding via the chart) and a CSV download.
 4. **Tab 4 - Trend comparisons.** A separate tool, independent of the
    polygon selected in tabs 1-3: upload two or more per-scene CSVs
    (exported from tab 3) and see them plotted as facets side by side -
    useful for comparing different polygons or different filter settings.
-   Each file becomes its own facet, labelled with its filename. The same
-   quality filters as tab 3 (month, minimum valid pixels, maximum snow/
-   cloud/smoke %) are applied across every uploaded file before plotting -
-   any column a given CSV doesn't have (an older export, or a hand-edited
-   file) is simply skipped for that one check rather than excluding
-   everything. Colour points by sensor, dataset, or month. Both plots have
-   the same independent linear-trend / GAM-smoothed-trend toggles as tab
-   3 - fit separately per dataset (per facet), since a single trend line
-   spanning several different polygons or runs wouldn't mean anything. A
-   **phenology plot** (mean value by month, July -> June, with the same
-   per-dataset trend toggles and slope annotation) sits below the
-   long-term trends plot, same as tab 3's.
+   Each file becomes its own facet, labelled with its filename. Choose the
+   **metric first** (NDVI, a tasselled cap band, or NDSI), same as tab 3 -
+   the quality filters below it (month, minimum valid pixels, maximum
+   snow % with the same fmask/NDSI/mixture "Snow detection method" choice
+   as tab 3, maximum cloud/smoke %) are applied across every uploaded file
+   before plotting, metric-aware in the same way tab 3's are (NDSI uses
+   its own broader valid-pixel gate). Any column a given CSV doesn't have
+   (an older export, or a hand-edited file) is simply skipped for that one
+   check rather than excluding everything. The long-term trends plot
+   colours points by sensor, dataset, or month, with the same independent
+   linear-trend / GAM-smoothed-trend toggles as tab 3 - fit separately per
+   dataset (per facet), since a single trend line spanning several
+   different polygons or runs wouldn't mean anything. A **phenology plot**
+   sits below it (mean value by month, water-year or calendar-year ordered
+   the same way and for the same reason as tab 3's), with its own
+   **"Years to include"** filter, its own **"Colour points by"** choice
+   (sensor or year - year uses the same continuous colour scale as tab 3),
+   and the same **"Fit trend: Combined vs Separate per year"** choice as
+   tab 3 - "Separate per year" here fits one trend line per year *within
+   each dataset facet*, so you can compare both across datasets and across
+   years at once.
 
 ## Why does 0% cloud cover return nothing?
 
@@ -159,16 +191,60 @@ floating-point noise" (capped at 99.9%) rather than requiring
 mathematically exact containment. Lower requests (50%, 90%, ...) aren't
 affected by this cap.
 
-## Why does the scene viewer's true-colour image sometimes look washed out?
+## Why does the scene viewer's true-colour image sometimes look washed out - or too dark?
 
-If it does, it's worth reporting - the true-colour view is built by
-percentile-stretching each band (2nd-98th percentile) over its own valid
-pixels. Genuine no-data pixels are excluded from that stretch using DEA's
-own `oa_fmask` no-data flag, which is more reliable than a single declared
-nodata value across different products - this keeps out-of-coverage fill
-(e.g. the edge of the 200m landscape-context buffer, past a scene's actual
-swath) from skewing the colour stretch. Cloud, shadow and snow are
-deliberately left visible rather than masked out.
+**Washed out (towards white):** worth reporting if you see this - the
+true-colour view is built by percentile-stretching each band (2nd-98th
+percentile) over its own valid pixels. Genuine no-data pixels are excluded
+from that stretch using DEA's own `oa_fmask` no-data flag, which is more
+reliable than a single declared nodata value across different products -
+this keeps out-of-coverage fill (e.g. the edge of the scene viewer's
+landscape-context buffer, past a scene's actual swath) from skewing the
+colour stretch. Cloud, shadow and snow are deliberately left visible
+rather than masked out.
+
+**Too dark (large areas look almost black):** this one's expected, not a
+bug, for a scene with a modest bright feature (typically snow) surrounded
+by a much larger area of dense or shadowed vegetation - the percentile
+stretch's upper clip point gets set by that bright feature, which linearly
+compresses the larger dark area down towards black. The "Shadow
+brightening" slider next to "Raster opacity" (True colour view only)
+applies a gamma correction after the linear stretch to lift that dark
+majority back into a visible range, without changing how bright the
+highlights already look. It defaults to 1.8; 1.0 is the plain linear
+stretch with no correction.
+
+## Which snow detection method should I use?
+
+DEA's `oa_fmask` cloud mask includes a snow class, but it isn't always
+accurate - it can miss thin or patchy snow, or misclassify it as cloud.
+Tab 3 offers two independent estimates of each scene's snow cover, plus a
+combination of both, via the "Snow detection method" control next to the
+"Maximum scene snow cover" filter:
+
+- **Cloud mask (oa_fmask snow class)** - the original method: the
+  percentage of the polygon `oa_fmask` classifies as snow. Fast, but
+  inherits whatever fmask itself gets wrong.
+- **NDSI (green/SWIR index)** - `(green - SWIR1) / (green + SWIR1)`,
+  computed per pixel; values above the NDSI snow threshold (tab 2's
+  "Advanced fetch options", default 0.4 - the standard MODIS convention)
+  count as snow. An independent estimate that can catch snow fmask
+  misses, but can itself be fooled by bright non-snow surfaces or
+  shadowed snow.
+- **Mixture** - a simple average of the two percentages above, since
+  neither detector is perfect on its own.
+
+Selecting **NDSI** as the *metric* (the dropdown at the top of tab 3,
+separate from the snow detection method above) plots it like any other
+index - mean ± SD per scene, on the time series/phenology plots and the
+pixel-mean raster - rather than as a flat percentage. Because NDSI's own
+valid-pixel mask keeps snow-covered pixels (unlike the vegetation-index
+mask, which excludes them), scenes too snow-covered to have an
+NDVI/tasselled-cap value still show up when NDSI is selected. NDSI's
+raster colour scale is reversed relative to the other metrics (a "Blues"
+ramp, light to dark) - snow (high NDSI) reads as white/pale and bare
+ground/vegetation (low NDSI) reads as blue, matching how snow actually
+looks.
 
 ## What if the run fails with a STAC/gateway error?
 
@@ -210,8 +286,9 @@ session, either, only per run.
   scenes at once (to build its clear-sky reference), but only for as long
   as `run_analysis()` is running - once `smoke_pct` is written into
   `scene_df`, those raw arrays are dropped immediately, before the function
-  returns. `AnalysisResult.scene_cache` only ever holds each scene's four
-  small metric arrays (NDVI/TCB/TCG/TCW).
+  returns. `AnalysisResult.scene_cache` only ever holds each scene's small
+  metric arrays (NDVI/TCB/TCG/TCW, plus NDSI wherever green/SWIR1 were
+  available).
 - **How big, really.** Tab 2's summary panel reports the actual measured
   size of `AnalysisResult.scene_cache` (via `analysis.cache_size_bytes()`,
   real `numpy.nbytes`, not an estimate) for the run you just did. For a
@@ -277,7 +354,9 @@ session, either, only per run.
   GeoDataFrame with a common `uid`/`source`/`label`/`area_ha` schema.
 - `modules/indices.py` - NDVI and Tasselled Cap Brightness/Greenness/Wetness
   calculations (Crist 1985 coefficients, applied to both sensors for a
-  directly comparable cross-sensor time series).
+  directly comparable cross-sensor time series), plus NDSI (a snow index,
+  computed separately since it needs its own, broader valid-pixel mask -
+  see `analysis.py`'s NDSI_VALID_FMASK_CLASSES).
 - `modules/analysis.py` - the DEA fetch + per-scene caching pipeline, plus
   the live re-filtering functions (`filter_scene_df`,
   `recompute_pixel_rasters`), the single-scene re-fetch used by the scene
@@ -327,11 +406,28 @@ length.
 **Per-pixel cloud/snow masking, not whole-scene rejection.** Rather than
 dropping an entire scene if any pixel over the polygon is cloud-affected,
 this app masks cloud/shadow/snow/no-data pixels individually (DEA's
-`oa_fmask`, keeping only classes 1/5 = clear/water as usable for the index
-maths) and computes each scene's mean/SD from whatever pixels remain. Snow
-and cloud percentages over the polygon (`snow_pct`, `cloud_pct`) are
-tracked per scene regardless, and tab 3's sliders let you reject whole
-scenes above a chosen threshold for either.
+`oa_fmask`, keeping only classes 1/5 = clear/water as usable for the
+vegetation-index maths) and computes each scene's mean/SD from whatever
+pixels remain. Snow and cloud percentages over the polygon (`snow_pct`,
+`cloud_pct`) are tracked per scene regardless, and tab 3's sliders let you
+reject whole scenes above a chosen threshold for either.
+
+**NDSI needs a broader mask than the vegetation indices, so it gets its
+own.** The whole point of adding NDSI was to reveal snow-covered scenes
+the vegetation-index mask (which excludes fmask's snow class) hides
+entirely. So `run_analysis()` computes a second, broader per-pixel mask
+for NDSI (classes 1/4/5 = clear/snow/water - only nodata and cloud/shadow
+are dropped) and a second set of columns (`n_valid_px_ndsi`,
+`pct_valid_ndsi`, `snow_pct_ndsi`) alongside the original vegetation-index
+ones. `filter_scene_df()`, `recompute_pixel_rasters()`, and
+`filter_uploaded_df()` all accept a `metric=` argument that switches to
+the NDSI-specific gate when `metric="NDSI"` - so a scene with zero usable
+pixels for NDVI/tasselled-cap can still have a perfectly good NDSI value,
+and won't be silently dropped just because another metric's gate would
+reject it. The NDSI snow threshold itself (default 0.4, tab 2's advanced
+fetch options) is baked in at fetch time, like the smoke sensitivity -
+not adjustable live, since it depends on a per-pixel NDSI array that's
+only kept transiently during the fetch.
 
 **Smoke/haze detection.** DEA's `oa_fmask` doesn't flag smoke or thin haze
 - both can still elevate NDVI-relevant reflectance without ever being

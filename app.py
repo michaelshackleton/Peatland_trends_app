@@ -5,7 +5,7 @@ Pick a bog/fen polygon (from the two Victorian & NSW alpine peatland
 layers bundled with this app) on a map, choose a date range and sensor(s),
 and this fetches every matching Landsat/Sentinel-2 scene from Digital
 Earth Australia and computes per-pixel NDVI / Tasselled Cap Brightness /
-Greenness / Wetness for each scene.
+Greenness / Wetness / NDSI (snow index) for each scene.
 
 Fetching (tab 2) and everything downstream of it (tab 3) are deliberately
 split: tab 2 only controls what gets *fetched* from DEA (date range,
@@ -74,9 +74,9 @@ SENTINEL_PIXEL_HA = (10 * 10) / 10000.0
 
 # Tab 3's single-scene viewer: how many scenes' rasters can be held (and
 # layered on the same map) at once. Each is small (a buffered square around
-# a bog/fen-sized polygon, see analysis.SCENE_VIEW_BUFFER_M) so memory isn't
-# the constraint - this is purely to keep the map/layer-control legible and
-# the "which scene is which" bookkeeping simple for the user.
+# a bog/fen-sized polygon, see analysis.SCENE_VIEW_TARGET_SIZE_M) so memory
+# isn't the constraint - this is purely to keep the map/layer-control
+# legible and the "which scene is which" bookkeeping simple for the user.
 MAX_VIEWED_SCENES = 5
 
 SENSOR_SYMBOLS = {"Landsat": "circle", "Sentinel-2": "diamond"}
@@ -96,13 +96,28 @@ MONTH_COLORS = {m: _month_color(m) for m in range(1, 13)}
 # unbroken block in the middle of the x-axis instead of being split across
 # both ends of it - matters for both readability and for the trend line fit
 # (a straight line across a Jan-Dec axis would otherwise connect December
-# back to January the "wrong" way round).
+# back to January the "wrong" way round). This is the right choice for the
+# vegetation metrics, but wrong for NDSI: Victorian/NSW alpine snow season
+# runs roughly June -> October, which the water-year ordering would instead
+# split across both ends of the axis (June at the far right, July-October
+# at the far left) - so NDSI uses plain calendar order instead, which is
+# what keeps *its* single season contiguous. See phenology_month_order().
 WATER_MONTH_ORDER = [7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6]
+CALENDAR_MONTH_ORDER = list(range(1, 13))
 
 
-def to_water_month(calendar_month) -> int:
-    """Calendar month (1-12, Jan=1) -> water-year position (1-12, Jul=1)."""
-    return ((calendar_month - 7) % 12) + 1
+def phenology_month_order(metric: str) -> list[int]:
+    """Which month ordering (see WATER_MONTH_ORDER's comment) the phenology
+    plot's x-axis should use for a given metric - calendar (Jan -> Dec) for
+    NDSI, water-year (Jul -> Jun) for everything else."""
+    return CALENDAR_MONTH_ORDER if metric == "NDSI" else WATER_MONTH_ORDER
+
+
+def to_phenology_month(calendar_month: int, month_order: list[int]) -> int:
+    """Calendar month (1-12, Jan=1) -> x-axis position (1-12) within
+    `month_order` - generalizes what used to be a water-year-only mapping
+    so the phenology plot can use either ordering depending on the metric."""
+    return month_order.index(calendar_month) + 1
 
 
 def facet_rc(i: int, n_cols: int) -> tuple[int, int]:
@@ -124,6 +139,25 @@ def build_categorical_color_map(values) -> dict:
     uniq = sorted({v for v in values if pd.notna(v)}, key=str)
     palette = px.colors.qualitative.Plotly
     return {v: palette[i % len(palette)] for i, v in enumerate(uniq)}
+
+
+def sequential_color_map(values, colorscale: str = "Viridis") -> dict:
+    """Assigns each unique value in `values` (assumed numerically orderable
+    - used here for years) a colour sampled from a continuous colorscale
+    according to its position in the sorted, de-duplicated list. Unlike
+    build_categorical_color_map's fixed qualitative palette (which repeats
+    once you run out of colours, ~10-24 of them), this scales to any number
+    of distinct values without repeating, and visually encodes their order
+    - useful for years, where "earlier vs later" is itself meaningful, e.g.
+    in the phenology plot's "colour points by year" mode."""
+    uniq = sorted({v for v in values if pd.notna(v)})
+    if not uniq:
+        return {}
+    if len(uniq) == 1:
+        return {uniq[0]: px.colors.sample_colorscale(colorscale, [0.5])[0]}
+    fracs = [i / (len(uniq) - 1) for i in range(len(uniq))]
+    colors = px.colors.sample_colorscale(colorscale, fracs)
+    return dict(zip(uniq, colors))
 
 
 def render_scene_selection_actions(sel_scenes: list, result, key_prefix: str) -> None:
@@ -379,8 +413,8 @@ with st.sidebar.expander("About this app", expanded=False):
         Select a bog/fen polygon from the two peatland layers bundled with
         this app, then fetch and analyse Landsat/Sentinel-2 scenes from
         Digital Earth Australia over it. Computes NDVI, Tasselled Cap
-        Brightness, Greenness and Wetness per scene, clipped to the
-        polygon.
+        Brightness, Greenness and Wetness, and NDSI (a snow index) per
+        scene, clipped to the polygon.
 
         Data access is anonymous/public DEA STAC - no personal account or
         API key needed. Scenes are fetched and processed in small batches
@@ -465,8 +499,9 @@ with tab_home:
         "fens have changed over time, using free satellite imagery from Digital Earth Australia "
         "(DEA) - Landsat back to March 1984, Sentinel-2 from 2015. Pick a bog or fen polygon, choose "
         "a date range and sensor(s), and it fetches every matching satellite scene, calculates "
-        "vegetation (NDVI) and wetness/brightness/greenness (tasselled cap) indices for the polygon, "
-        "and lets you explore long-term trends, seasonal patterns, and individual scenes."
+        "vegetation (NDVI), wetness/brightness/greenness (tasselled cap), and snow cover (NDSI) "
+        "indices for the polygon, and lets you explore long-term trends, seasonal patterns, and "
+        "individual scenes."
     )
     st.caption(
         "DEA access is anonymous and public - no account, API key, or credential is needed anywhere "
@@ -488,8 +523,12 @@ with tab_home:
    tile-coverage requirement, and a smoke/haze sensitivity - the defaults are sensible for most runs.
 3. **Results.** Everything here updates live as you change a filter, exclude a scene, or switch
    metric - no re-fetch needed:
+   - Choose a **metric** first - NDVI, a tasselled cap band, or **NDSI** (snow cover, plotted as a
+     proper index rather than a flat percentage, and able to show scenes too snow-covered for any
+     other metric).
    - Data-quality filters (minimum valid pixels, maximum snow/cloud/smoke %) decide which fetched
-     scenes count toward the raster and plots below.
+     scenes count toward the raster and plots below - snow % can be checked via fmask, NDSI, or a
+     mixture of both.
    - A **pixel-mean raster** map shows the average value per pixel over your polygon, per sensor.
    - A **time series** and a **phenology plot** (seasonal pattern, by month) both support optional
      linear and GAM-smoothed trend lines.
@@ -514,17 +553,22 @@ with tab_home:
   flags a scene, check it with the single-scene viewer before trusting it, and adjust tab 2's
   sensitivity if needed.
 - **The phenology plot runs July -> June**, not January -> December, so a Southern Hemisphere
-  summer growing season shows as one unbroken block instead of being split across the year.
+  summer growing season shows as one unbroken block instead of being split across the year -
+  except for NDSI, which runs January -> December instead, since that's what keeps the alpine
+  snow season (roughly June-October) together in one block.
 - **A dotted line at zero on tasselled cap wetness (TCW) plots** marks the rough threshold above
   which open water is typically present.
-- **NDVI's raster legend is fixed to its canonical -1 to 1 range**, so colour is comparable across
-  different runs and polygons rather than autoscaling to whatever narrow range your data happens to
-  fall in. Other metrics still autoscale.
+- **NDVI and NDSI's raster legends are fixed to their canonical -1 to 1 range**, so colour is
+  comparable across different runs and polygons rather than autoscaling to whatever narrow range
+  your data happens to fall in. Other metrics still autoscale.
+- **oa_fmask's snow classification isn't always accurate** - tab 3 also offers an NDSI-based snow
+  estimate and a mixture of both, selectable via "Snow detection method" next to the snow filter.
 - **The scene viewer holds up to 5 scenes at once**, layered on the same map - use the layer control
   (top right of the map, once more than one scene is shown) or the "Remove" buttons above the map to
   toggle or drop individual scenes. Raster visibility and opacity are also adjustable, and each scene
-  shows a 200 m buffer around the polygon (drawn as a dashed outline over the top, with an option to
-  hide it) rather than just the polygon itself, for landscape context.
+  is cropped to roughly a 2km x 2km square around the polygon (or, for a polygon already bigger than
+  that, a 200 m buffer beyond it, same as before) - drawn as a dashed outline over the top, with an
+  option to hide it - rather than just the polygon itself, for landscape context.
 - **Long date ranges (e.g. 1985-present) are searched a few years at a time and retried** if DEA's
   STAC gateway times out, since that's more common on large multi-year searches. If a run still
   ends with a "STAC search failed" warning under tab 2, it's usually a transient gateway hiccup -
@@ -649,6 +693,14 @@ with tab_run:
                 "This is a starting point, not validated for these sites - use tab 3's 'view this scene' "
                 "feature to sanity-check flagged scenes against their true-colour image.",
             )
+            ndsi_snow_threshold = st.number_input(
+                "NDSI snow threshold", min_value=-1.0, max_value=1.0,
+                value=float(analysis.DEFAULT_NDSI_SNOW_THRESHOLD), step=0.05,
+                help="Pixels with NDSI = (green - SWIR) / (green + SWIR) above this are classed as "
+                "snow for the NDSI-based snow_pct estimate (tab 3's 'Snow detection method'). "
+                "0.4 is the standard MODIS-convention threshold - a reasonable starting point, not "
+                "validated for these sites.",
+            )
             batch_size = st.number_input(
                 "Scenes per batch", min_value=1, max_value=50, value=15,
                 help="Scenes are fetched and processed this many at a time during the DEA request, so "
@@ -679,6 +731,7 @@ with tab_run:
                     max_cloud=max_cloud,
                     min_coverage_pct=min_coverage_pct,
                     smoke_threshold_dn=float(smoke_threshold_dn),
+                    ndsi_snow_threshold=float(ndsi_snow_threshold),
                     batch_size=int(batch_size),
                     progress_cb=progress_cb,
                 )
@@ -744,16 +797,45 @@ with tab_results:
     else:
         df_all = result.scene_df.copy()
 
+        # ---- Metric -------------------------------------------------------
+        # Chosen before the quality filters below, since NDSI needs its own
+        # valid-pixel gate (see filter_scene_df's metric= argument) - a
+        # heavily snow-covered scene the vegetation-index gate hard-drops
+        # can still pass when NDSI is the metric being viewed.
+        st.subheader("Metric")
+        metric = st.selectbox(
+            "Metric", METRICS, format_func=lambda m: METRIC_LABELS.get(m, m), key="tab3_metric_select"
+        )
+        mean_col, std_col = f"{metric}_mean", f"{metric}_std"
+        # "Blues_r" (reversed) for NDSI so snow (high NDSI) reads as white/
+        # pale and bare ground/vegetation (low NDSI) reads as blue - the
+        # plain "Blues" ramp put snow at the dark end, which read backwards.
+        colorscale = "RdYlGn" if metric in ("NDVI", "TCG") else ("Blues_r" if metric == "NDSI" else "YlGnBu")
+
         # ---- Live data-quality filters ---------------------------------
         st.subheader("Data quality filters")
         st.caption("These apply instantly to everything below, without re-fetching from DEA.")
         qc1, qc2 = st.columns(2)
         with qc1:
-            min_valid_pct = st.slider("Minimum valid pixels per scene (%)", 0, 100, 50, key="qc_min_valid")
+            min_valid_pct = st.slider(
+                "Minimum valid pixels per scene (%)", 0, 100, 50, key="qc_min_valid",
+                help="Checked against NDSI's own valid-pixel % (which keeps snow-covered pixels) "
+                "when NDSI is the selected metric above, otherwise the vegetation-index valid-pixel %.",
+            )
             max_snow_pct = st.slider(
                 "Maximum scene snow cover (%)", 0, 100, 100, key="qc_max_snow",
-                help="Snow pixels are always excluded from the index calculations themselves; this "
-                "rejects whole scenes above a chosen snow extent.",
+                help="Snow pixels are always excluded from the vegetation-index calculations "
+                "themselves; this rejects whole scenes above a chosen snow extent. Which snow "
+                "estimate this checks is set by 'Snow detection method' below.",
+            )
+            snow_method = st.selectbox(
+                "Snow detection method", list(analysis.SNOW_METHOD_LABELS.keys()),
+                format_func=lambda m: analysis.SNOW_METHOD_LABELS.get(m, m),
+                index=list(analysis.SNOW_METHOD_LABELS.keys()).index(analysis.DEFAULT_SNOW_METHOD),
+                key="qc_snow_method",
+                help="oa_fmask's cloud-mask snow class isn't always accurate. NDSI (green/SWIR) is "
+                "an independent per-pixel estimate; 'Mixture' averages the two. This choice decides "
+                "which snow % estimate the 'Maximum scene snow cover' slider above checks against.",
             )
         with qc2:
             max_cloud_pct = st.slider(
@@ -776,20 +858,17 @@ with tab_results:
                 st.rerun()
 
         kept_df = analysis.filter_scene_df(
-            df_all, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct, excluded_keys
+            df_all, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct, excluded_keys,
+            metric=metric, snow_method=snow_method,
         )
         pixel_rasters = analysis.recompute_pixel_rasters(
-            result, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct, excluded_keys
+            result, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct, excluded_keys,
+            snow_method=snow_method,
         )
         st.caption(f"{len(kept_df)} of {len(df_all)} fetched scenes currently pass these filters.")
 
         st.divider()
         available_products = sorted({code for (code, _m) in pixel_rasters.keys()})
-        metric = st.selectbox(
-            "Metric", METRICS, format_func=lambda m: METRIC_LABELS.get(m, m), key="tab3_metric_select"
-        )
-        mean_col, std_col = f"{metric}_mean", f"{metric}_std"
-        colorscale = "RdYlGn" if metric in ("NDVI", "TCG") else "YlGnBu"
 
         # ---- Pixel-mean raster ------------------------------------------
         st.subheader("Pixel-mean raster")
@@ -807,7 +886,7 @@ with tab_results:
             else:
                 mean_arr = raster["mean"]
                 n_scenes_arr = raster["n_scenes"]
-                raster_vmin, raster_vmax = (-1.0, 1.0) if metric == "NDVI" else (None, None)
+                raster_vmin, raster_vmax = (-1.0, 1.0) if metric in ("NDVI", "NDSI") else (None, None)
                 overlay = raster_viz.raster_overlay_layer(
                     mean_arr, raster["transform"], raster["crs"], METRIC_LABELS.get(metric, metric), colorscale,
                     vmin=raster_vmin, vmax=raster_vmax,
@@ -961,78 +1040,6 @@ with tab_results:
 
             render_scene_selection_actions(sel_scenes, result, key_prefix="ts")
 
-        # ---- Snow cover over time --------------------------------------------
-        # Deliberately NOT built from `kept_df` - the quality filters above
-        # (particularly "minimum valid pixels") hard-drop any scene with zero
-        # valid (non-cloud/shadow/snow) pixels, which is exactly the kind of
-        # scene someone most often wants to inspect here (e.g. to confirm a
-        # scene really is snow-covered, rather than something having gone
-        # wrong upstream). This plots snow_pct for every fetched scene,
-        # respecting only manual excludes and the month filter above - not
-        # the valid-pixel/snow/cloud/smoke thresholds - so any fetched scene
-        # can be selected and added to the scene viewer regardless of whether
-        # it passes those thresholds. No trend lines or error bars: this is a
-        # diagnostic scatter of a single per-scene percentage, not an index.
-        st.divider()
-        st.subheader("Snow cover over time")
-        st.caption(
-            "Every fetched scene's snow cover over the polygon, including scenes with too few "
-            "valid pixels to appear in the plot above - useful for spot-checking or viewing "
-            "heavily snow-covered scenes directly, since NDVI/tasselled-cap values can't be "
-            "computed for those."
-        )
-        snow_all = result.scene_df.copy()
-        snow_all["datetime"] = pd.to_datetime(snow_all["datetime"])
-        snow_all["month"] = snow_all["datetime"].dt.month
-        snow_keys = snow_all["product"] + "::" + snow_all["item_id"].astype(str)
-        snow_all = snow_all[~snow_keys.isin(st.session_state.excluded_keys)]
-
-        if not month_choice:
-            st.info("Select at least one month above.")
-            snow_ts = snow_all.iloc[0:0]
-        else:
-            snow_ts = snow_all[snow_all["month"].isin(month_choice)]
-
-        if len(snow_ts) == 0:
-            st.info("No scenes fall in the selected month(s), or all have been excluded.")
-        else:
-            fig_snow = go.Figure()
-            has_multi_sensor_snow = snow_ts["sensor"].nunique() > 1
-            for mo in sorted(snow_ts["month"].unique()):
-                sub = snow_ts[snow_ts["month"] == mo].sort_values("datetime")
-                symbols = [SENSOR_SYMBOLS.get(s, "circle") for s in sub["sensor"]]
-                fig_snow.add_trace(
-                    go.Scatter(
-                        x=sub["datetime"], y=sub["snow_pct"],
-                        mode="markers", name=calendar.month_name[mo],
-                        marker=dict(size=8, color=MONTH_COLORS[mo], symbol=symbols,
-                                    line=dict(width=1, color="rgba(0,0,0,0.4)")),
-                        customdata=sub[["item_id", "product", "date", "sensor"]].values,
-                        hovertemplate="%{customdata[3]} %{customdata[2]}<br>Snow cover: %{y:.1f}%<extra></extra>",
-                    )
-                )
-            if has_multi_sensor_snow:
-                st.caption("Marker shape: ● Landsat, ◆ Sentinel-2. Colour = month.")
-            fig_snow.update_layout(
-                yaxis_title="Snow cover over polygon (%)", xaxis_title="Date",
-                yaxis_range=[-3, 103], height=420, legend_title="Month",
-            )
-            snow_event = st.plotly_chart(
-                fig_snow, use_container_width=True, on_select="rerun",
-                selection_mode=("points", "box", "lasso"), key="snow_chart",
-            )
-
-            snow_sel_points = []
-            if snow_event and snow_event.get("selection"):
-                snow_sel_points = snow_event["selection"].get("points", [])
-            snow_sel_scenes = []
-            for pt in snow_sel_points:
-                cd = pt.get("customdata")
-                if cd and len(cd) >= 4:
-                    snow_sel_scenes.append(dict(item_id=cd[0], product=cd[1], date=cd[2], sensor=cd[3]))
-
-            render_scene_selection_actions(snow_sel_scenes, result, key_prefix="snow")
-
         # ---- Multi-scene raster viewer ---------------------------------------
         # Up to MAX_VIEWED_SCENES scenes' rasters in memory here at once -
         # fetch_single_scene() re-fetches directly from DEA on demand (nothing
@@ -1072,29 +1079,64 @@ with tab_results:
                     "Raster opacity", min_value=0, max_value=100, value=85,
                     key="scene_raster_opacity", disabled=not show_raster,
                 )
+            true_colour_gamma = 1.8
+            if view_mode == "True colour":
+                true_colour_gamma = st.slider(
+                    "Shadow brightening", min_value=1.0, max_value=3.0, value=1.8, step=0.1,
+                    key="scene_true_colour_gamma", disabled=not show_raster,
+                    help="The true-colour stretch is set by the brightest/darkest pixels anywhere in "
+                    "the buffered view, not just the polygon - a modest amount of snow next to a much "
+                    "larger area of dense/shadowed vegetation can leave that larger area looking "
+                    "almost black. Raising this lifts shadows and midtones back into a visible range "
+                    "without changing how bright highlights (e.g. snow) already look; 1.0 is the plain "
+                    "linear stretch.",
+                )
             st.caption(
-                f"Each cropped to a square {analysis.SCENE_VIEW_BUFFER_M:.0f} m beyond the polygon on "
-                "every side, for landscape context - not just the polygon itself. With more than one "
-                "scene shown, use the layer control (top right of the map) to toggle individual scenes."
+                f"Each cropped to a square roughly {analysis.SCENE_VIEW_TARGET_SIZE_M / 1000:.0f} km "
+                "across for landscape context (or, for a polygon already bigger than that, a "
+                f"{analysis.SCENE_VIEW_BUFFER_M:.0f} m buffer beyond the polygon on every side) - not "
+                "just the polygon itself. With more than one scene shown, use the layer control (top "
+                "right of the map) to toggle individual scenes."
             )
 
             scene_map = folium.Map(tiles=None, control_scale=True)
             satellite_tile_layer().add_to(scene_map)
 
+            # One shared colour scale for the metric-layer view, computed
+            # across every currently-loaded scene's array for this metric -
+            # not autoscaled per scene - so overlays from different scenes
+            # are directly comparable, and only one legend needs to be
+            # shown regardless of how many scenes are loaded. NDVI/NDSI
+            # still use their fixed -1..1 range, same as elsewhere.
+            shared_vmin, shared_vmax = None, None
+            if view_mode != "True colour":
+                if metric in ("NDVI", "NDSI"):
+                    shared_vmin, shared_vmax = -1.0, 1.0
+                else:
+                    metric_arrays = [
+                        v["data"]["metrics"][metric] for v in viewed_scenes
+                        if v["data"]["metrics"].get(metric) is not None
+                        and np.any(np.isfinite(v["data"]["metrics"][metric]))
+                    ]
+                    if metric_arrays:
+                        shared_vmin = float(min(np.nanmin(a) for a in metric_arrays))
+                        shared_vmax = float(max(np.nanmax(a) for a in metric_arrays))
+
             all_bounds = []
             downloads = []  # (label, array, kind, transform, crs, key)
+            shared_legend = None
             for v in viewed_scenes:
                 cached = v["data"]
                 vlabel = f"{v['sensor']} {v['date']}"
                 bounds = None
-                legend = None
                 download_arr = None
                 download_kind = None
                 try:
                     if view_mode == "True colour":
                         if cached["rgb"] is not None:
                             layer_out = raster_viz.rgb_overlay_layer(
-                                cached["rgb"], cached["transform"], cached["crs"], opacity=raster_opacity / 100.0
+                                cached["rgb"], cached["transform"], cached["crs"],
+                                opacity=raster_opacity / 100.0, gamma=true_colour_gamma,
                             )
                             if layer_out is not None:
                                 data_uri, bounds = layer_out
@@ -1102,14 +1144,15 @@ with tab_results:
                     else:
                         arr = cached["metrics"].get(metric)
                         if arr is not None:
-                            scene_vmin, scene_vmax = (-1.0, 1.0) if metric == "NDVI" else (None, None)
                             layer_out = raster_viz.raster_overlay_layer(
                                 arr, cached["transform"], cached["crs"], METRIC_LABELS.get(metric, metric),
-                                colorscale, vmin=scene_vmin, vmax=scene_vmax, opacity=raster_opacity / 100.0,
+                                colorscale, vmin=shared_vmin, vmax=shared_vmax, opacity=raster_opacity / 100.0,
                             )
                             if layer_out is not None:
                                 data_uri, bounds, legend, _vmin, _vmax = layer_out
                                 download_arr, download_kind = arr, "single"
+                                if shared_legend is None:
+                                    shared_legend = legend
                 except Exception as e:
                     st.caption(f"Could not render {vlabel}: {e}")
 
@@ -1120,11 +1163,12 @@ with tab_results:
                             image=data_uri, bounds=bounds, opacity=1.0, interactive=False,
                             cross_origin=False, name=vlabel,
                         ).add_to(scene_map)
-                        if legend is not None:
-                            legend.add_to(scene_map)
                     downloads.append(
                         (vlabel, download_arr, download_kind, cached["transform"], cached["crs"], v["key"])
                     )
+
+            if show_raster and shared_legend is not None:
+                shared_legend.add_to(scene_map)
 
             if show_outline:
                 outline_gdf = gpd.GeoDataFrame(geometry=[sel.geometry], crs=polygons.WGS84)
@@ -1148,7 +1192,7 @@ with tab_results:
                 map_key_part = "_".join(v["key"] for v in viewed_scenes)
                 st_folium(
                     scene_map,
-                    key=f"scene_view_map_{map_key_part}_{view_mode}_{show_raster}_{raster_opacity}",
+                    key=f"scene_view_map_{map_key_part}_{view_mode}_{show_raster}_{raster_opacity}_{true_colour_gamma}",
                     height=550, use_container_width=True, returned_objects=[],
                 )
 
@@ -1194,107 +1238,208 @@ with tab_results:
         # ---- Phenology ------------------------------------------------------
         st.divider()
         st.subheader("Phenology - mean value by month")
-        st.caption(
-            "Every scene passing the quality filters above, across all years, plotted by month, "
-            "running July -> June to keep the (Southern Hemisphere) growing season together in one "
-            "block - shows the within-year seasonal pattern independent of any long-term trend."
-        )
+        phen_month_order = phenology_month_order(metric)
+        if metric == "NDSI":
+            st.caption(
+                "Every scene passing the quality filters above, across all years, plotted by month, "
+                "running January -> December - the alpine snow season (roughly June-October) stays "
+                "together in one block this way, unlike the water-year ordering used for the other "
+                "metrics. Shows the within-year seasonal pattern independent of any long-term trend."
+            )
+        else:
+            st.caption(
+                "Every scene passing the quality filters above, across all years, plotted by month, "
+                "running July -> June to keep the (Southern Hemisphere) growing season together in one "
+                "block - shows the within-year seasonal pattern independent of any long-term trend."
+            )
         phen_src = kept_df.dropna(subset=[mean_col]).copy()
         if len(phen_src) == 0:
             st.info("No scenes available for the phenology plot after quality filtering.")
         else:
             phen_src["datetime"] = pd.to_datetime(phen_src["datetime"])
             phen_src["month"] = phen_src["datetime"].dt.month
-            phen_src["water_month"] = phen_src["month"].apply(to_water_month)
+            phen_src["water_month"] = phen_src["month"].apply(lambda m: to_phenology_month(m, phen_month_order))
             phen_src["year"] = phen_src["datetime"].dt.year
             phen_src["month_abbr"] = phen_src["month"].apply(lambda mo: calendar.month_abbr[mo])
 
-            phen_trend_c1, phen_trend_c2 = st.columns(2)
-            with phen_trend_c1:
+            phen_years_available = sorted(phen_src["year"].unique().tolist())
+            phen_year_choice = st.multiselect(
+                "Years to include", options=phen_years_available, default=phen_years_available,
+                key="phen_year_choice",
+            )
+
+            phen_c1, phen_c2, phen_c3 = st.columns(3)
+            with phen_c1:
                 phen_linear_on = st.radio("Linear trend", ["Off", "On"], horizontal=True, key="phen_linear") == "On"
-            with phen_trend_c2:
+            with phen_c2:
                 phen_gam_on = st.radio("GAM (smoothed) trend", ["Off", "On"], horizontal=True, key="phen_gam") == "On"
-
-            fig_phen = go.Figure()
-            for s, sub in phen_src.groupby("sensor"):
-                fig_phen.add_trace(
-                    go.Scatter(
-                        x=sub["water_month"], y=sub[mean_col], mode="markers", name=s,
-                        marker=dict(size=7, opacity=0.6, symbol=SENSOR_SYMBOLS.get(s, "circle")),
-                        customdata=sub[["year", "month_abbr"]].values,
-                        hovertemplate="%{customdata[1]} %{customdata[0]}<br>Value %{y:.3f}<extra></extra>",
-                    )
+            with phen_c3:
+                phen_color_by = st.radio(
+                    "Colour points by", ["Sensor", "Year"], horizontal=True, key="phen_color_by"
                 )
-            monthly_mean = phen_src.groupby("water_month")[mean_col].mean().reindex(range(1, 13))
-            fig_phen.add_trace(
-                go.Scatter(
-                    x=monthly_mean.index, y=monthly_mean.values, mode="lines+markers",
-                    name="Monthly mean (all sensors/years)",
-                    line=dict(color="black", width=2), marker=dict(size=8, symbol="diamond"),
-                )
-            )
 
-            x_month = phen_src["water_month"].astype(float).values
-            y_val = phen_src[mean_col].values
-            if phen_linear_on:
-                lt = trends.linear_trend(x_month, y_val)
-                if lt is not None:
+            phen_trend_mode = "Combined (all years)"
+            if phen_linear_on or phen_gam_on:
+                phen_trend_mode = st.radio(
+                    "Fit trend", ["Combined (all years)", "Separate per year"],
+                    horizontal=True, key="phen_trend_mode",
+                    help="Combined pools every selected year's points into one trend line - the "
+                    "seasonal pattern averaged across all of them. Separate fits and draws one trend "
+                    "line per year instead, so you can compare how the seasonal pattern itself has "
+                    "shifted from year to year.",
+                )
+
+            if not phen_year_choice:
+                st.info("Select at least one year above.")
+            else:
+                phen_plot = phen_src[phen_src["year"].isin(phen_year_choice)]
+                if len(phen_plot) == 0:
+                    st.info("No scenes fall in the selected year(s).")
+                else:
+                    year_colors = sequential_color_map(phen_plot["year"].unique())
+
+                    fig_phen = go.Figure()
+                    if phen_color_by == "Year":
+                        for yr, sub in phen_plot.groupby("year"):
+                            fig_phen.add_trace(
+                                go.Scatter(
+                                    x=sub["water_month"], y=sub[mean_col], mode="markers", name=str(yr),
+                                    marker=dict(
+                                        size=7, opacity=0.65, color=year_colors.get(yr),
+                                        symbol=[SENSOR_SYMBOLS.get(s, "circle") for s in sub["sensor"]],
+                                    ),
+                                    customdata=sub[["year", "month_abbr", "sensor"]].values,
+                                    hovertemplate="%{customdata[2]} %{customdata[1]} %{customdata[0]}"
+                                    "<br>Value %{y:.3f}<extra></extra>",
+                                )
+                            )
+                        phen_legend_title = "Year"
+                    else:
+                        for s, sub in phen_plot.groupby("sensor"):
+                            fig_phen.add_trace(
+                                go.Scatter(
+                                    x=sub["water_month"], y=sub[mean_col], mode="markers", name=s,
+                                    marker=dict(size=7, opacity=0.6, symbol=SENSOR_SYMBOLS.get(s, "circle")),
+                                    customdata=sub[["year", "month_abbr"]].values,
+                                    hovertemplate="%{customdata[1]} %{customdata[0]}<br>Value %{y:.3f}<extra></extra>",
+                                )
+                            )
+                        phen_legend_title = "Sensor"
+
+                    monthly_mean = phen_plot.groupby("water_month")[mean_col].mean().reindex(range(1, 13))
                     fig_phen.add_trace(
                         go.Scatter(
-                            x=lt.x, y=lt.y, mode="lines", name="Linear trend",
-                            line=dict(color="#2C3E50", dash="dash", width=2),
+                            x=monthly_mean.index, y=monthly_mean.values, mode="lines+markers",
+                            name="Monthly mean (selected years)",
+                            line=dict(color="black", width=2), marker=dict(size=8, symbol="diamond"),
                         )
                     )
-                    mid_i = len(lt.x) // 2
-                    fig_phen.add_annotation(
-                        x=lt.x[mid_i], y=lt.y[mid_i],
-                        text=f"Slope = {lt.slope_per_day:+.4f} / month (R²={lt.r2:.2f})",
-                        showarrow=True, arrowhead=1, ax=0, ay=-35,
-                        font=dict(color="#2C3E50", size=12),
-                    )
-                else:
-                    st.caption("Not enough points for a linear trend.")
-            if phen_gam_on:
-                x_grid, y_grid, gam_error = trends.gam_trend(x_month, y_val)
-                if gam_error is None:
-                    fig_phen.add_trace(
-                        go.Scatter(
-                            x=x_grid, y=y_grid, mode="lines", name="GAM smoothed trend",
-                            line=dict(color="#8E44AD", width=3),
-                        )
-                    )
-                else:
-                    st.caption(f"Could not fit a GAM trend: {gam_error}")
 
-            if metric == "TCW":
-                fig_phen.add_hline(
-                    y=0, line_dash="dot", line_color="#1B4F72", line_width=1.5,
-                    annotation_text="0 - possible open water", annotation_position="bottom right",
-                    annotation_font_color="#1B4F72",
-                )
-            fig_phen.update_layout(
-                xaxis=dict(
-                    title="Month", tickmode="array", tickvals=list(range(1, 13)),
-                    ticktext=[calendar.month_abbr[m] for m in WATER_MONTH_ORDER],
-                ),
-                yaxis_title=METRIC_LABELS.get(metric, metric), height=520, legend_title="Sensor",
-            )
-            st.plotly_chart(fig_phen, use_container_width=True)
+                    if phen_trend_mode == "Separate per year":
+                        linear_fail_years, gam_fail_years = [], []
+                        for yr, sub in phen_plot.groupby("year"):
+                            x_yr = sub["water_month"].astype(float).values
+                            y_yr = sub[mean_col].values
+                            trend_color = year_colors.get(yr, "#2C3E50")
+                            if phen_linear_on:
+                                lt = trends.linear_trend(x_yr, y_yr)
+                                if lt is not None:
+                                    fig_phen.add_trace(
+                                        go.Scatter(
+                                            x=lt.x, y=lt.y, mode="lines", name=f"Linear trend {yr}",
+                                            legendgroup=f"phen_trend_{yr}",
+                                            line=dict(color=trend_color, dash="dash", width=2),
+                                        )
+                                    )
+                                else:
+                                    linear_fail_years.append(yr)
+                            if phen_gam_on:
+                                x_grid, y_grid, gam_error = trends.gam_trend(x_yr, y_yr)
+                                if gam_error is None:
+                                    fig_phen.add_trace(
+                                        go.Scatter(
+                                            x=x_grid, y=y_grid, mode="lines", name=f"GAM trend {yr}",
+                                            legendgroup=f"phen_trend_{yr}",
+                                            line=dict(color=trend_color, width=3),
+                                        )
+                                    )
+                                else:
+                                    gam_fail_years.append(yr)
+                        if linear_fail_years:
+                            st.caption(
+                                "Not enough points for a linear trend: "
+                                + ", ".join(str(y) for y in linear_fail_years) + "."
+                            )
+                        if gam_fail_years:
+                            st.caption(
+                                "Could not fit a GAM trend: " + ", ".join(str(y) for y in gam_fail_years) + "."
+                            )
+                    else:
+                        x_month = phen_plot["water_month"].astype(float).values
+                        y_val = phen_plot[mean_col].values
+                        if phen_linear_on:
+                            lt = trends.linear_trend(x_month, y_val)
+                            if lt is not None:
+                                fig_phen.add_trace(
+                                    go.Scatter(
+                                        x=lt.x, y=lt.y, mode="lines", name="Linear trend",
+                                        line=dict(color="#2C3E50", dash="dash", width=2),
+                                    )
+                                )
+                                mid_i = len(lt.x) // 2
+                                fig_phen.add_annotation(
+                                    x=lt.x[mid_i], y=lt.y[mid_i],
+                                    text=f"Slope = {lt.slope_per_day:+.4f} / month (R²={lt.r2:.2f})",
+                                    showarrow=True, arrowhead=1, ax=0, ay=-35,
+                                    font=dict(color="#2C3E50", size=12),
+                                )
+                            else:
+                                st.caption("Not enough points for a linear trend.")
+                        if phen_gam_on:
+                            x_grid, y_grid, gam_error = trends.gam_trend(x_month, y_val)
+                            if gam_error is None:
+                                fig_phen.add_trace(
+                                    go.Scatter(
+                                        x=x_grid, y=y_grid, mode="lines", name="GAM smoothed trend",
+                                        line=dict(color="#8E44AD", width=3),
+                                    )
+                                )
+                            else:
+                                st.caption(f"Could not fit a GAM trend: {gam_error}")
+
+                    if metric == "TCW":
+                        fig_phen.add_hline(
+                            y=0, line_dash="dot", line_color="#1B4F72", line_width=1.5,
+                            annotation_text="0 - possible open water", annotation_position="bottom right",
+                            annotation_font_color="#1B4F72",
+                        )
+                    fig_phen.update_layout(
+                        xaxis=dict(
+                            title="Month", tickmode="array", tickvals=list(range(1, 13)),
+                            ticktext=[calendar.month_abbr[m] for m in phen_month_order],
+                        ),
+                        yaxis_title=METRIC_LABELS.get(metric, metric), height=520,
+                        legend_title=phen_legend_title,
+                    )
+                    st.plotly_chart(fig_phen, use_container_width=True)
 
         # ---- Per-scene table --------------------------------------------------
         st.divider()
         st.subheader("Per-scene data")
         hide_empty = st.checkbox(
             "Hide scenes with no valid pixels", value=True,
-            help="Hides scenes where cloud/shadow/snow/no-data masking left zero usable pixels over "
-            "the polygon.",
+            help="Hides scenes where masking left zero usable pixels over the polygon for the "
+            "currently selected metric - NDSI's own (snow-inclusive) valid-pixel count when NDSI "
+            "is selected above, otherwise cloud/shadow/snow/no-data masking for the vegetation "
+            "indices.",
         )
         sensor_filter = st.multiselect(
             "Filter by sensor", sorted(df_all["sensor"].unique()), default=sorted(df_all["sensor"].unique())
         )
         table_df = df_all[df_all["sensor"].isin(sensor_filter)] if sensor_filter else df_all.copy()
         if hide_empty:
-            table_df = table_df[table_df["n_valid_px"] > 0]
+            empty_gate_col = "n_valid_px_ndsi" if metric == "NDSI" and "n_valid_px_ndsi" in table_df.columns else "n_valid_px"
+            table_df = table_df[table_df[empty_gate_col] > 0]
         table_df = table_df.reset_index(drop=True)
         table_keys = table_df["product"] + "::" + table_df["item_id"].astype(str)
         table_df.insert(0, "excluded", table_keys.isin(st.session_state.excluded_keys).values)
@@ -1373,6 +1518,19 @@ with tab_compare:
                     "data CSVs exported from tab 3?"
                 )
             else:
+                # ---- Metric --------------------------------------------------
+                # Chosen before the filters below, same as tab 3 - NDSI needs
+                # its own valid-pixel gate (see filter_uploaded_df's metric=
+                # argument), so a heavily snow-covered scene the vegetation-
+                # index gate would drop can still pass when NDSI is selected.
+                st.subheader("Metric")
+                cmp_metric = st.selectbox(
+                    "Metric", available_metrics, format_func=lambda m: METRIC_LABELS.get(m, m),
+                    key="cmp_metric_select",
+                )
+                cmp_mean_col = f"{cmp_metric}_mean"
+                cmp_std_col = f"{cmp_metric}_std"
+
                 # ---- Filters (same quality gate as tab 3, applied across
                 # every uploaded dataset before plotting) --------------------
                 st.subheader("Filters")
@@ -1389,10 +1547,22 @@ with tab_compare:
                 fq1, fq2 = st.columns(2)
                 with fq1:
                     cmp_min_valid = st.slider(
-                        "Minimum valid pixels per scene (%)", 0, 100, 50, key="cmp_min_valid"
+                        "Minimum valid pixels per scene (%)", 0, 100, 50, key="cmp_min_valid",
+                        help="Checked against NDSI's own valid-pixel % when NDSI is the selected "
+                        "metric above (uploaded files that predate NDSI won't have that column, so "
+                        "this falls back to the vegetation-index one for them).",
                     )
                     cmp_max_snow = st.slider(
                         "Maximum scene snow cover (%)", 0, 100, 100, key="cmp_max_snow"
+                    )
+                    cmp_snow_method = st.selectbox(
+                        "Snow detection method", list(analysis.SNOW_METHOD_LABELS.keys()),
+                        format_func=lambda m: analysis.SNOW_METHOD_LABELS.get(m, m),
+                        index=list(analysis.SNOW_METHOD_LABELS.keys()).index(analysis.DEFAULT_SNOW_METHOD),
+                        key="cmp_snow_method",
+                        help="Same choice as tab 3 - which snow % estimate 'Maximum scene snow cover' "
+                        "checks against. Falls back to the plain snow_pct column for uploaded files "
+                        "that predate this (no snow_pct_ndsi/snow_pct_fmask columns).",
                     )
                 with fq2:
                     cmp_max_cloud = st.slider(
@@ -1408,7 +1578,7 @@ with tab_compare:
                 else:
                     filtered = analysis.filter_uploaded_df(
                         combined, cmp_min_valid, cmp_max_snow, cmp_max_cloud, cmp_max_smoke,
-                        months=cmp_month_choice,
+                        months=cmp_month_choice, metric=cmp_metric, snow_method=cmp_snow_method,
                     )
                 st.caption(f"{len(filtered)} of {len(combined)} uploaded rows currently pass these filters.")
 
@@ -1417,22 +1587,14 @@ with tab_compare:
                 color_labels = [
                     label for label, col in color_col_by_label.items() if col in combined.columns
                 ] or ["dataset"]
-                cmp_c1, cmp_c2, cmp_c3 = st.columns(3)
+                cmp_c1, cmp_c2 = st.columns(2)
                 with cmp_c1:
-                    cmp_metric = st.selectbox(
-                        "Metric", available_metrics, format_func=lambda m: METRIC_LABELS.get(m, m),
-                        key="cmp_metric_select",
-                    )
-                with cmp_c2:
                     facet_cols_input = st.number_input(
                         "Facets per row", min_value=1, max_value=6, value=3, key="cmp_facet_cols"
                     )
-                with cmp_c3:
+                with cmp_c2:
                     color_by_label = st.selectbox("Colour points by", color_labels, key="cmp_color_by")
                 color_by = color_col_by_label[color_by_label]
-
-                cmp_mean_col = f"{cmp_metric}_mean"
-                cmp_std_col = f"{cmp_metric}_std"
                 plot_df = filtered.dropna(subset=[cmp_mean_col]).sort_values("datetime")
                 if cmp_std_col not in plot_df.columns:
                     plot_df[cmp_std_col] = None
@@ -1537,113 +1699,222 @@ with tab_compare:
                     # ---- Phenology (faceted, one subplot per dataset) ------------
                     st.divider()
                     st.markdown("**Phenology - mean value by month**")
-                    st.caption(
-                        "Every point across all years, by month, running July -> June (Southern "
-                        "Hemisphere growing season), one facet per dataset - same as tab 3's phenology "
-                        "plot, fit and drawn separately per dataset."
+                    cmp_phen_month_order = phenology_month_order(cmp_metric)
+                    if cmp_metric == "NDSI":
+                        st.caption(
+                            "Every point across all years, by month, running January -> December (keeps "
+                            "the alpine snow season together in one block), one facet per dataset - same "
+                            "as tab 3's phenology plot, fit and drawn separately per dataset."
+                        )
+                    else:
+                        st.caption(
+                            "Every point across all years, by month, running July -> June (Southern "
+                            "Hemisphere growing season), one facet per dataset - same as tab 3's phenology "
+                            "plot, fit and drawn separately per dataset."
+                        )
+                    phen_df_all = plot_df.copy()
+                    phen_df_all["water_month"] = phen_df_all["month"].apply(
+                        lambda m: to_phenology_month(m, cmp_phen_month_order)
                     )
-                    phen_trend_c1, phen_trend_c2 = st.columns(2)
-                    with phen_trend_c1:
+                    phen_df_all["year"] = phen_df_all["datetime"].dt.year
+                    phen_df_all["month_abbr"] = phen_df_all["month"].apply(lambda mo: calendar.month_abbr[mo])
+
+                    phen_years_available = sorted(phen_df_all["year"].unique().tolist())
+                    cmp_phen_year_choice = st.multiselect(
+                        "Years to include", options=phen_years_available, default=phen_years_available,
+                        key="cmp_phen_year_choice",
+                    )
+
+                    phen_ctrl_c1, phen_ctrl_c2, phen_ctrl_c3 = st.columns(3)
+                    with phen_ctrl_c1:
                         cmp_phen_linear_on = st.radio(
                             "Linear trend", ["Off", "On"], horizontal=True, key="cmp_phen_linear"
                         ) == "On"
-                    with phen_trend_c2:
+                    with phen_ctrl_c2:
                         cmp_phen_gam_on = st.radio(
                             "GAM (smoothed) trend", ["Off", "On"], horizontal=True, key="cmp_phen_gam"
                         ) == "On"
-
-                    phen_df = plot_df.copy()
-                    phen_df["water_month"] = phen_df["month"].apply(to_water_month)
-                    phen_df["year"] = phen_df["datetime"].dt.year
-                    phen_df["month_abbr"] = phen_df["month"].apply(lambda mo: calendar.month_abbr[mo])
-                    sensor_color_map = (
-                        build_categorical_color_map(phen_df["sensor"]) if "sensor" in phen_df.columns else {}
-                    )
-
-                    fig_phen_cmp = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=dataset_order)
-                    phen_linear_fails, phen_gam_fails = [], []
-                    for i, ds in enumerate(dataset_order):
-                        r, c = facet_rc(i, n_cols)
-                        sub_ds = phen_df[phen_df["dataset"] == ds]
-                        sensor_groups = (
-                            sub_ds.groupby("sensor") if "sensor" in sub_ds.columns else [(ds, sub_ds)]
+                    with phen_ctrl_c3:
+                        cmp_phen_color_by = st.radio(
+                            "Colour points by", ["Sensor", "Year"], horizontal=True, key="cmp_phen_color_by"
                         )
-                        for sensor_val, g in sensor_groups:
-                            fig_phen_cmp.add_trace(
-                                go.Scatter(
-                                    x=g["water_month"], y=g[cmp_mean_col], mode="markers", name=str(sensor_val),
-                                    legendgroup=str(sensor_val), showlegend=(i == 0),
-                                    marker=dict(
-                                        size=6, opacity=0.65, symbol=SENSOR_SYMBOLS.get(sensor_val, "circle"),
-                                        color=sensor_color_map.get(sensor_val),
-                                    ),
-                                    customdata=g[["year", "month_abbr"]].values,
-                                    hovertemplate="%{customdata[1]} %{customdata[0]}<br>Value %{y:.3f}<extra></extra>",
-                                ),
-                                row=r, col=c,
+
+                    cmp_phen_trend_mode = "Combined (all years)"
+                    if cmp_phen_linear_on or cmp_phen_gam_on:
+                        cmp_phen_trend_mode = st.radio(
+                            "Fit trend", ["Combined (all years)", "Separate per year"],
+                            horizontal=True, key="cmp_phen_trend_mode",
+                            help="Combined pools every selected year's points (within each dataset "
+                            "facet) into one trend line. Separate fits and draws one trend line per "
+                            "year instead, so you can compare how the seasonal pattern itself has "
+                            "shifted from year to year - still fit and drawn separately per dataset "
+                            "facet either way.",
+                        )
+
+                    if not cmp_phen_year_choice:
+                        st.info("Select at least one year above.")
+                    else:
+                        phen_df = phen_df_all[phen_df_all["year"].isin(cmp_phen_year_choice)]
+                        if len(phen_df) == 0:
+                            st.info("No scenes fall in the selected year(s).")
+                        else:
+                            sensor_color_map = (
+                                build_categorical_color_map(phen_df["sensor"])
+                                if "sensor" in phen_df.columns else {}
                             )
-                        monthly_mean = sub_ds.groupby("water_month")[cmp_mean_col].mean().reindex(range(1, 13))
-                        fig_phen_cmp.add_trace(
-                            go.Scatter(
-                                x=monthly_mean.index, y=monthly_mean.values, mode="lines+markers",
-                                name="Monthly mean", legendgroup="monthly_mean", showlegend=(i == 0),
-                                line=dict(color="black", width=2), marker=dict(size=6, symbol="diamond"),
-                            ),
-                            row=r, col=c,
-                        )
-                        x_month = sub_ds["water_month"].astype(float).values
-                        y_val = sub_ds[cmp_mean_col].values
-                        if cmp_phen_linear_on:
-                            lt = trends.linear_trend(x_month, y_val)
-                            if lt is not None:
-                                fig_phen_cmp.add_trace(
-                                    go.Scatter(
-                                        x=lt.x, y=lt.y, mode="lines", name="Linear trend",
-                                        legendgroup="phen_linear_trend", showlegend=(i == 0),
-                                        line=dict(color="#2C3E50", dash="dash", width=2),
-                                    ),
-                                    row=r, col=c,
-                                )
-                                mid_i = len(lt.x) // 2
-                                fig_phen_cmp.add_annotation(
-                                    x=lt.x[mid_i], y=lt.y[mid_i], text=f"{lt.slope_per_day:+.4f}/mo",
-                                    showarrow=True, arrowhead=1, ax=0, ay=-25,
-                                    font=dict(color="#2C3E50", size=10), row=r, col=c,
-                                )
-                            else:
-                                phen_linear_fails.append(ds)
-                        if cmp_phen_gam_on:
-                            xg, yg, err = trends.gam_trend(x_month, y_val)
-                            if err is None:
-                                fig_phen_cmp.add_trace(
-                                    go.Scatter(
-                                        x=xg, y=yg, mode="lines", name="GAM smoothed trend",
-                                        legendgroup="phen_gam_trend", showlegend=(i == 0),
-                                        line=dict(color="#8E44AD", width=3),
-                                    ),
-                                    row=r, col=c,
-                                )
-                            else:
-                                phen_gam_fails.append(f"{ds} ({err})")
+                            year_color_map = sequential_color_map(phen_df["year"].unique())
 
-                    if cmp_metric == "TCW":
-                        fig_phen_cmp.add_hline(
-                            y=0, line_dash="dot", line_color="#1B4F72", line_width=1.5, row="all", col="all",
-                        )
-                    # Shared axes across facets here too - see the same note on fig_trends
-                    # above.
-                    fig_phen_cmp.update_xaxes(
-                        tickmode="array", tickvals=list(range(1, 13)),
-                        ticktext=[calendar.month_abbr[m] for m in WATER_MONTH_ORDER], title_text="Month",
-                        matches="x",
-                    )
-                    fig_phen_cmp.update_yaxes(matches="y", showticklabels=True, title_text=metric_label)
-                    fig_phen_cmp.update_layout(height=350 * n_rows)
-                    st.plotly_chart(fig_phen_cmp, use_container_width=True)
-                    if phen_linear_fails:
-                        st.caption(f"Not enough points for a linear trend: {', '.join(phen_linear_fails)}.")
-                    if phen_gam_fails:
-                        st.caption(f"Could not fit a GAM trend: {'; '.join(phen_gam_fails)}.")
+                            fig_phen_cmp = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=dataset_order)
+                            phen_linear_fails, phen_gam_fails = [], []
+                            seen_legend_names = set()
+                            for i, ds in enumerate(dataset_order):
+                                r, c = facet_rc(i, n_cols)
+                                sub_ds = phen_df[phen_df["dataset"] == ds]
+
+                                if cmp_phen_color_by == "Year":
+                                    point_groups = sub_ds.groupby("year")
+                                    group_color_map = year_color_map
+                                else:
+                                    point_groups = (
+                                        sub_ds.groupby("sensor") if "sensor" in sub_ds.columns
+                                        else [(ds, sub_ds)]
+                                    )
+                                    group_color_map = sensor_color_map
+
+                                for group_val, g in point_groups:
+                                    name = str(group_val)
+                                    show = name not in seen_legend_names
+                                    seen_legend_names.add(name)
+                                    if cmp_phen_color_by == "Year":
+                                        symbol = (
+                                            [SENSOR_SYMBOLS.get(s, "circle") for s in g["sensor"]]
+                                            if "sensor" in g.columns else "circle"
+                                        )
+                                    else:
+                                        symbol = SENSOR_SYMBOLS.get(group_val, "circle")
+                                    fig_phen_cmp.add_trace(
+                                        go.Scatter(
+                                            x=g["water_month"], y=g[cmp_mean_col], mode="markers", name=name,
+                                            legendgroup=name, showlegend=show,
+                                            marker=dict(
+                                                size=6, opacity=0.65, symbol=symbol,
+                                                color=group_color_map.get(group_val),
+                                            ),
+                                            customdata=g[["year", "month_abbr"]].values,
+                                            hovertemplate="%{customdata[1]} %{customdata[0]}"
+                                            "<br>Value %{y:.3f}<extra></extra>",
+                                        ),
+                                        row=r, col=c,
+                                    )
+
+                                monthly_mean = sub_ds.groupby("water_month")[cmp_mean_col].mean().reindex(range(1, 13))
+                                mm_show = "Monthly mean" not in seen_legend_names
+                                seen_legend_names.add("Monthly mean")
+                                fig_phen_cmp.add_trace(
+                                    go.Scatter(
+                                        x=monthly_mean.index, y=monthly_mean.values, mode="lines+markers",
+                                        name="Monthly mean", legendgroup="monthly_mean", showlegend=mm_show,
+                                        line=dict(color="black", width=2), marker=dict(size=6, symbol="diamond"),
+                                    ),
+                                    row=r, col=c,
+                                )
+
+                                if cmp_phen_trend_mode == "Separate per year":
+                                    for yr, sub_yr in sub_ds.groupby("year"):
+                                        x_yr = sub_yr["water_month"].astype(float).values
+                                        y_yr = sub_yr[cmp_mean_col].values
+                                        trend_color = year_color_map.get(yr, "#2C3E50")
+                                        if cmp_phen_linear_on:
+                                            lt = trends.linear_trend(x_yr, y_yr)
+                                            if lt is not None:
+                                                lt_name = f"Linear trend {yr}"
+                                                lt_show = lt_name not in seen_legend_names
+                                                seen_legend_names.add(lt_name)
+                                                fig_phen_cmp.add_trace(
+                                                    go.Scatter(
+                                                        x=lt.x, y=lt.y, mode="lines", name=lt_name,
+                                                        legendgroup=lt_name, showlegend=lt_show,
+                                                        line=dict(color=trend_color, dash="dash", width=2),
+                                                    ),
+                                                    row=r, col=c,
+                                                )
+                                            else:
+                                                phen_linear_fails.append(f"{ds} {yr}")
+                                        if cmp_phen_gam_on:
+                                            xg, yg, err = trends.gam_trend(x_yr, y_yr)
+                                            if err is None:
+                                                gt_name = f"GAM trend {yr}"
+                                                gt_show = gt_name not in seen_legend_names
+                                                seen_legend_names.add(gt_name)
+                                                fig_phen_cmp.add_trace(
+                                                    go.Scatter(
+                                                        x=xg, y=yg, mode="lines", name=gt_name,
+                                                        legendgroup=gt_name, showlegend=gt_show,
+                                                        line=dict(color=trend_color, width=3),
+                                                    ),
+                                                    row=r, col=c,
+                                                )
+                                            else:
+                                                phen_gam_fails.append(f"{ds} {yr} ({err})")
+                                else:
+                                    x_month = sub_ds["water_month"].astype(float).values
+                                    y_val = sub_ds[cmp_mean_col].values
+                                    if cmp_phen_linear_on:
+                                        lt = trends.linear_trend(x_month, y_val)
+                                        if lt is not None:
+                                            fig_phen_cmp.add_trace(
+                                                go.Scatter(
+                                                    x=lt.x, y=lt.y, mode="lines", name="Linear trend",
+                                                    legendgroup="phen_linear_trend", showlegend=(i == 0),
+                                                    line=dict(color="#2C3E50", dash="dash", width=2),
+                                                ),
+                                                row=r, col=c,
+                                            )
+                                            mid_i = len(lt.x) // 2
+                                            fig_phen_cmp.add_annotation(
+                                                x=lt.x[mid_i], y=lt.y[mid_i], text=f"{lt.slope_per_day:+.4f}/mo",
+                                                showarrow=True, arrowhead=1, ax=0, ay=-25,
+                                                font=dict(color="#2C3E50", size=10), row=r, col=c,
+                                            )
+                                        else:
+                                            phen_linear_fails.append(ds)
+                                    if cmp_phen_gam_on:
+                                        xg, yg, err = trends.gam_trend(x_month, y_val)
+                                        if err is None:
+                                            fig_phen_cmp.add_trace(
+                                                go.Scatter(
+                                                    x=xg, y=yg, mode="lines", name="GAM smoothed trend",
+                                                    legendgroup="phen_gam_trend", showlegend=(i == 0),
+                                                    line=dict(color="#8E44AD", width=3),
+                                                ),
+                                                row=r, col=c,
+                                            )
+                                        else:
+                                            phen_gam_fails.append(f"{ds} ({err})")
+
+                            if cmp_metric == "TCW":
+                                fig_phen_cmp.add_hline(
+                                    y=0, line_dash="dot", line_color="#1B4F72", line_width=1.5,
+                                    row="all", col="all",
+                                )
+                            # Shared axes across facets here too - see the same note on fig_trends
+                            # above.
+                            fig_phen_cmp.update_xaxes(
+                                tickmode="array", tickvals=list(range(1, 13)),
+                                ticktext=[calendar.month_abbr[m] for m in cmp_phen_month_order],
+                                title_text="Month", matches="x",
+                            )
+                            fig_phen_cmp.update_yaxes(matches="y", showticklabels=True, title_text=metric_label)
+                            fig_phen_cmp.update_layout(height=350 * n_rows)
+                            st.plotly_chart(fig_phen_cmp, use_container_width=True)
+                            if phen_linear_fails:
+                                st.caption(
+                                    "Not enough points for a linear trend: " + ", ".join(phen_linear_fails) + "."
+                                )
+                            if phen_gam_fails:
+                                st.caption(
+                                    "Could not fit a GAM trend: " + "; ".join(phen_gam_fails) + "."
+                                )
 
                 st.divider()
                 st.subheader("Filtered data")

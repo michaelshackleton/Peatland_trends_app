@@ -2,7 +2,7 @@
 Core analysis pipeline: for one selected polygon, fetches Landsat and/or
 Sentinel-2 surface reflectance scenes from Digital Earth Australia's STAC
 catalogue and computes per-pixel NDVI / Tasselled Cap Brightness /
-Greenness / Wetness for each scene.
+Greenness / Wetness / NDSI (snow index) for each scene.
 
 Two-stage design:
 
@@ -89,7 +89,7 @@ if _VENDOR_DIR not in sys.path:
 from rs_data import STACDataManager  # noqa: E402
 from rs_processing import RSDataProductManager  # noqa: E402
 
-from .indices import compute_indices, METRICS  # noqa: E402
+from .indices import compute_indices, compute_ndsi, METRICS  # noqa: E402
 from .smoke_detection import (  # noqa: E402
     DEFAULT_SMOKE_THRESHOLD_DN,
     build_clear_sky_reference,
@@ -111,6 +111,33 @@ FMASK_VALID_CLASSES = [1, 5]
 SNOW_FMASK_CLASS = 4
 CLOUD_FMASK_CLASSES = [2, 3]
 NODATA_FMASK_CLASS = 0
+
+# NDSI needs a *broader* validity mask than the vegetation indices above:
+# the whole point of adding it is to reveal snow-covered scenes, so its mask
+# must keep the snow class rather than exclude it - it only drops nodata and
+# cloud/shadow, where reflectance isn't meaningful for any index.
+NDSI_VALID_FMASK_CLASSES = [1, 4, 5]
+
+# Standard MODIS-convention NDSI snow threshold (Hall et al. 1995,
+# Riggs/Hall/Salomonson MOD10 algorithm): pixels with NDSI above this are
+# classed as snow. Exposed as a fetch-time parameter (tab 2's "Advanced
+# fetch options"), like smoke_threshold_dn, since it's baked into
+# scene_df's snow_pct_ndsi at fetch time rather than recomputed live.
+DEFAULT_NDSI_SNOW_THRESHOLD = 0.4
+
+# tab 3's "snow detection method" choice - which of the three per-scene
+# snow_pct estimates the "maximum scene snow cover" quality filter checks
+# against. "mixture" is a simple average of the fmask- and NDSI-based
+# percentages: neither detector is perfect (fmask can miss thin/patchy snow
+# fmask's algorithm wasn't tuned to catch; NDSI can be fooled by bright
+# non-snow surfaces or shadowed snow), so averaging is a reasonable,
+# easy-to-explain default rather than picking a winner.
+DEFAULT_SNOW_METHOD = "fmask"
+SNOW_METHOD_LABELS = {
+    "fmask": "Cloud mask (oa_fmask snow class)",
+    "ndsi": "NDSI (green/SWIR index)",
+    "mixture": "Mixture (average of both)",
+}
 
 ProgressCB = Optional[Callable[[str, float], None]]
 
@@ -258,11 +285,41 @@ def _polygon_pixel_mask(roi_gdf_projected: gpd.GeoDataFrame, ref_da) -> np.ndarr
     return mask == 1
 
 
-# fetch_single_scene()'s default landscape-context buffer - see that
-# function's docstring for why this is a square rather than just the
-# polygon's own (often much smaller and more irregularly-shaped) bounding
-# box padded out.
+# fetch_single_scene()'s landscape-context buffer - see that function's
+# docstring for why this is a square rather than just the polygon's own
+# (often much smaller and more irregularly-shaped) bounding box padded out.
+# SCENE_VIEW_BUFFER_M is the *floor*: most bog/fen polygons are tiny, so a
+# flat 200m buffer around them would only show a few hundred metres of
+# landscape context - not enough to orient the view. _scene_view_buffer_m()
+# below instead aims for a SCENE_VIEW_TARGET_SIZE_M (2km) square by default,
+# expanding the buffer as needed for small polygons, and only falls back to
+# this flat minimum once the polygon itself is already big enough that a 2km
+# target would under-buffer (or even crop) it.
 SCENE_VIEW_BUFFER_M = 200.0
+SCENE_VIEW_TARGET_SIZE_M = 2000.0
+
+
+def _scene_view_buffer_m(
+    roi_gdf: gpd.GeoDataFrame,
+    target_crs: int,
+    target_size_m: float = SCENE_VIEW_TARGET_SIZE_M,
+    min_buffer_m: float = SCENE_VIEW_BUFFER_M,
+) -> float:
+    """Buffer distance (metres, applied on every side by
+    `_buffered_square_gdf`) for the "Inspect scene" viewer: enough to bring
+    the total square up to `target_size_m` (2km x 2km by default) for small
+    polygons, but never less than `min_buffer_m`. For a polygon whose own
+    extent already exceeds `target_size_m`, aiming for a flat 2km square
+    would under-buffer it (or even crop pixels off), so the buffer falls
+    back to the flat minimum around the polygon's own (already large)
+    extent instead - i.e. exactly the old fixed-200m behaviour, but only
+    once the polygon is big enough that "2km square" no longer makes sense
+    as a target."""
+    projected = roi_gdf.to_crs(target_crs)
+    minx, miny, maxx, maxy = projected.total_bounds
+    extent = max(maxx - minx, maxy - miny)
+    buffer_for_target = (target_size_m - extent) / 2.0
+    return max(buffer_for_target, min_buffer_m)
 
 
 def _buffered_square_gdf(roi_gdf: gpd.GeoDataFrame, target_crs: int, buffer_m: float) -> gpd.GeoDataFrame:
@@ -362,6 +419,7 @@ def run_analysis(
     max_cloud: float = 100.0,
     min_coverage_pct: float = 100.0,
     smoke_threshold_dn: float = DEFAULT_SMOKE_THRESHOLD_DN,
+    ndsi_snow_threshold: float = DEFAULT_NDSI_SNOW_THRESHOLD,
     batch_size: int = 15,
     progress_cb: ProgressCB = None,
 ) -> AnalysisResult:
@@ -385,7 +443,10 @@ def run_analysis(
     this time computed over the polygon itself, not the whole tile - and
     smoke/haze %) is NOT done here; see `filter_scene_df()` and
     `recompute_pixel_rasters()` below, which work from this function's
-    cached output without needing to re-fetch anything.
+    cached output without needing to re-fetch anything. The one exception
+    is `ndsi_snow_threshold`: like `smoke_threshold_dn`, it's baked into
+    scene_df's snow_pct_ndsi column at fetch time (not adjustable live),
+    since it depends on a per-pixel NDSI array only kept transiently here.
 
     The STAC *search* itself (finding which scenes exist, before fetching
     any of their pixels) is done a few years at a time and retried on
@@ -536,21 +597,32 @@ def run_analysis(
                 if not ok:
                     continue
 
-                valid = pm.copy()
+                base_valid = pm.copy()
                 for arr in raw_bands.values():
-                    valid = valid & (arr != nodata_val) & np.isfinite(arr)
+                    base_valid = base_valid & (arr != nodata_val) & np.isfinite(arr)
                 snow_px = 0
                 cloud_px = 0
                 fmask_arr = None
+                # `valid`: the vegetation-index gate (clear/water only, per
+                # FMASK_VALID_CLASSES) - unchanged from before. `valid_ndsi`:
+                # a broader gate that keeps the snow class too (per
+                # NDSI_VALID_FMASK_CLASSES), so NDSI can still be computed -
+                # and reveal snow cover - for scenes `valid` hard-excludes.
                 if fmask_var and fmask_var in scene.data_vars:
                     fmask_arr = np.asarray(scene[fmask_var].values)
-                    valid = valid & np.isin(fmask_arr, FMASK_VALID_CLASSES)
+                    valid = base_valid & np.isin(fmask_arr, FMASK_VALID_CLASSES)
+                    valid_ndsi = base_valid & np.isin(fmask_arr, NDSI_VALID_FMASK_CLASSES)
                     snow_px = int((pm & (fmask_arr == SNOW_FMASK_CLASS)).sum())
                     cloud_px = int((pm & np.isin(fmask_arr, CLOUD_FMASK_CLASSES)).sum())
+                else:
+                    valid = base_valid
+                    valid_ndsi = base_valid
 
                 valid_px = int(valid.sum())
+                valid_px_ndsi = int(valid_ndsi.sum())
                 pct_valid = (100.0 * valid_px / total_px) if total_px else 0.0
-                snow_pct = (100.0 * snow_px / total_px) if total_px else 0.0
+                pct_valid_ndsi = (100.0 * valid_px_ndsi / total_px) if total_px else 0.0
+                snow_pct_fmask = (100.0 * snow_px / total_px) if total_px else 0.0
                 cloud_pct = (100.0 * cloud_px / total_px) if total_px else 0.0
 
                 metrics = {}
@@ -560,6 +632,17 @@ def run_analysis(
                         for canon, arr in raw_bands.items()
                     }
                     metrics = compute_indices(refl)
+
+                snow_px_ndsi = 0
+                if valid_px_ndsi > 0 and "green" in raw_bands and "swir1" in raw_bands:
+                    refl_ndsi = {
+                        "green": np.where(valid_ndsi, raw_bands["green"] / REFLECTANCE_SCALE, np.nan),
+                        "swir1": np.where(valid_ndsi, raw_bands["swir1"] / REFLECTANCE_SCALE, np.nan),
+                    }
+                    ndsi_arr = compute_ndsi(refl_ndsi)
+                    metrics["NDSI"] = ndsi_arr
+                    snow_px_ndsi = int(np.nansum(ndsi_arr > ndsi_snow_threshold))
+                snow_pct_ndsi = (100.0 * snow_px_ndsi / total_px) if total_px else 0.0
 
                 ts = pd.Timestamp(t)
                 meta = item_meta.get(ts.strftime("%Y-%m-%dT%H:%M:%S"), {})
@@ -572,15 +655,29 @@ def run_analysis(
                     item_id=item_id,
                     cloud_cover_pct=meta.get("cloud_cover_pct"),
                     n_valid_px=valid_px,
+                    n_valid_px_ndsi=valid_px_ndsi,
                     n_polygon_px=total_px,
                     pct_valid=round(pct_valid, 1),
-                    snow_pct=round(snow_pct, 1),
+                    pct_valid_ndsi=round(pct_valid_ndsi, 1),
+                    # snow_pct is kept as an alias of snow_pct_fmask (the
+                    # original, sole snow estimate) for backward
+                    # compatibility with anything reading an older-shaped
+                    # scene_df (e.g. tab 4 CSV exports from before NDSI was
+                    # added). See SNOW_METHOD_LABELS / _snow_pct_for_method
+                    # for how tab 3 actually picks between the three.
+                    snow_pct=round(snow_pct_fmask, 1),
+                    snow_pct_fmask=round(snow_pct_fmask, 1),
+                    snow_pct_ndsi=round(snow_pct_ndsi, 1),
                     cloud_pct=round(cloud_pct, 1),
                     smoke_pct=0.0,  # filled in below, once every scene's been fetched
                 )
                 for m in METRICS:
                     arr = metrics.get(m)
-                    if arr is not None and valid_px > 0:
+                    # NDSI is gated on its own (broader) valid-pixel count,
+                    # not the vegetation-index one - see this loop's masks
+                    # above for why they can differ for the same scene.
+                    m_valid_px = valid_px_ndsi if m == "NDSI" else valid_px
+                    if arr is not None and m_valid_px > 0:
                         row[f"{m}_mean"] = float(np.nanmean(arr))
                         row[f"{m}_std"] = float(np.nanstd(arr))
                     else:
@@ -588,7 +685,7 @@ def run_analysis(
                         row[f"{m}_std"] = np.nan
                 scene_rows.append(row)
 
-                if valid_px > 0:
+                if valid_px > 0 or valid_px_ndsi > 0:
                     scene_cache[scene_key(product_code, item_id)] = SceneCacheEntry(
                         product_code=product_code,
                         item_id=item_id,
@@ -634,7 +731,8 @@ def run_analysis(
         fetch_params=dict(
             start_date=start_date, end_date=end_date, product_codes=list(product_codes),
             max_cloud=max_cloud, min_coverage_pct=min_coverage_pct,
-            smoke_threshold_dn=smoke_threshold_dn, batch_size=batch_size,
+            smoke_threshold_dn=smoke_threshold_dn, ndsi_snow_threshold=ndsi_snow_threshold,
+            batch_size=batch_size,
         ),
         warnings=warnings,
     )
@@ -662,6 +760,25 @@ def _fill_smoke_pct(scene_df, scene_cache, product_codes, polygon_total_px, thre
             scene_df.loc[mask, "smoke_pct"] = round(pct, 1)
 
 
+def _snow_pct_for_method(df: pd.DataFrame, snow_method: str) -> pd.Series:
+    """Picks (or computes) the per-scene snow_pct Series to check the
+    "maximum scene snow cover" filter against, per `snow_method` ("fmask" /
+    "ndsi" / "mixture" - see SNOW_METHOD_LABELS). Falls back to the plain
+    `snow_pct` column (present even in pre-NDSI scene_df's, e.g. an older
+    tab 4 CSV export) wherever a method-specific column is missing, so this
+    degrades gracefully rather than raising."""
+    method = (snow_method or DEFAULT_SNOW_METHOD).lower()
+    legacy = df["snow_pct"] if "snow_pct" in df.columns else pd.Series(0.0, index=df.index)
+    fmask_col = df["snow_pct_fmask"] if "snow_pct_fmask" in df.columns else legacy
+    if method == "ndsi":
+        return df["snow_pct_ndsi"] if "snow_pct_ndsi" in df.columns else legacy
+    if method == "mixture":
+        if "snow_pct_ndsi" in df.columns:
+            return (fmask_col + df["snow_pct_ndsi"]) / 2.0
+        return fmask_col
+    return fmask_col  # "fmask" (default)
+
+
 def filter_scene_df(
     scene_df: pd.DataFrame,
     min_valid_pct: float = 0.0,
@@ -669,20 +786,37 @@ def filter_scene_df(
     max_cloud_pct: float = 100.0,
     max_smoke_pct: float = 100.0,
     excluded_keys: Optional[set] = None,
+    metric: Optional[str] = None,
+    snow_method: str = DEFAULT_SNOW_METHOD,
 ) -> pd.DataFrame:
     """Applies the same quality gate `recompute_pixel_rasters()` uses to
     build the pixel raster, so the time-series/phenology plots and the
-    raster stay in sync. Rows that never had any valid pixels at all
-    (n_valid_px == 0) are always dropped here - there's nothing to plot for
-    them regardless of thresholds."""
+    raster stay in sync. Rows that never had any valid pixels at all for
+    the metric being viewed are always dropped here - there's nothing to
+    plot for them regardless of thresholds.
+
+    `metric="NDSI"` switches the valid-pixel gate to NDSI's own, broader
+    columns (n_valid_px_ndsi/pct_valid_ndsi) instead of the vegetation-index
+    ones (n_valid_px/pct_valid) - NDSI's mask doesn't exclude fmask's snow
+    class, so a heavily snow-covered scene the vegetation gate hard-drops
+    can still pass here and show up when NDSI is the selected metric. Any
+    other (or no) metric uses the original vegetation-index gate.
+    `snow_method` picks which snow_pct estimate `max_snow_pct` is checked
+    against - see `_snow_pct_for_method()`."""
     excluded_keys = excluded_keys or set()
     if len(scene_df) == 0:
         return scene_df
     keys = scene_df["product"] + "::" + scene_df["item_id"].astype(str)
+    use_ndsi_gate = metric == "NDSI" and "n_valid_px_ndsi" in scene_df.columns
+    valid_px_col = "n_valid_px_ndsi" if use_ndsi_gate else "n_valid_px"
+    pct_valid_col = (
+        "pct_valid_ndsi" if use_ndsi_gate and "pct_valid_ndsi" in scene_df.columns else "pct_valid"
+    )
+    snow_series = _snow_pct_for_method(scene_df, snow_method)
     keep = (
-        (scene_df["n_valid_px"] > 0)
-        & (scene_df["pct_valid"] >= min_valid_pct)
-        & (scene_df["snow_pct"] <= max_snow_pct)
+        (scene_df[valid_px_col] > 0)
+        & (scene_df[pct_valid_col] >= min_valid_pct)
+        & (snow_series <= max_snow_pct)
         & (scene_df.get("cloud_pct", 0.0) <= max_cloud_pct)
         & (scene_df.get("smoke_pct", 0.0) <= max_smoke_pct)
         & (~keys.isin(excluded_keys))
@@ -697,26 +831,34 @@ def filter_uploaded_df(
     max_cloud_pct: float = 100.0,
     max_smoke_pct: float = 100.0,
     months: Optional[list] = None,
+    metric: Optional[str] = None,
+    snow_method: str = DEFAULT_SNOW_METHOD,
 ) -> pd.DataFrame:
     """Same quality gate as `filter_scene_df()`, for tab 4's uploaded CSVs
     rather than a live `AnalysisResult`. Deliberately more forgiving:
     per the README, tab 4 accepts any per-scene CSV "as long as the columns
     match" - which could be an older export missing a column this app added
-    later (e.g. smoke_pct), or a hand-edited file without n_valid_px/
-    product/item_id at all - so every check here is skipped (not enforced,
-    not an error) if its column isn't present, rather than requiring the
-    full schema `filter_scene_df()` can assume from a fresh run. Expects a
-    `month` column (1-12) already computed from `datetime` if filtering by
-    month; `months=None` means no month filtering."""
+    later (e.g. smoke_pct, or the NDSI columns added after it), or a
+    hand-edited file without n_valid_px/product/item_id at all - so every
+    check here is skipped (not enforced, not an error) if its column isn't
+    present, rather than requiring the full schema `filter_scene_df()` can
+    assume from a fresh run. Expects a `month` column (1-12) already
+    computed from `datetime` if filtering by month; `months=None` means no
+    month filtering. `metric="NDSI"` uses n_valid_px_ndsi/pct_valid_ndsi
+    instead of n_valid_px/pct_valid where present, same as
+    `filter_scene_df()`."""
     if len(df) == 0:
         return df
     keep = pd.Series(True, index=df.index)
-    if "n_valid_px" in df.columns:
-        keep &= df["n_valid_px"] > 0
-    if "pct_valid" in df.columns:
-        keep &= df["pct_valid"] >= min_valid_pct
-    if "snow_pct" in df.columns:
-        keep &= df["snow_pct"] <= max_snow_pct
+    use_ndsi_gate = metric == "NDSI" and "n_valid_px_ndsi" in df.columns
+    valid_px_col = "n_valid_px_ndsi" if use_ndsi_gate else "n_valid_px"
+    pct_valid_col = "pct_valid_ndsi" if use_ndsi_gate and "pct_valid_ndsi" in df.columns else "pct_valid"
+    if valid_px_col in df.columns:
+        keep &= df[valid_px_col] > 0
+    if pct_valid_col in df.columns:
+        keep &= df[pct_valid_col] >= min_valid_pct
+    if "snow_pct" in df.columns or "snow_pct_fmask" in df.columns:
+        keep &= _snow_pct_for_method(df, snow_method) <= max_snow_pct
     if "cloud_pct" in df.columns:
         keep &= df["cloud_pct"] <= max_cloud_pct
     if "smoke_pct" in df.columns:
@@ -733,23 +875,38 @@ def recompute_pixel_rasters(
     max_cloud_pct: float = 100.0,
     max_smoke_pct: float = 100.0,
     excluded_keys: Optional[set] = None,
+    snow_method: str = DEFAULT_SNOW_METHOD,
 ) -> dict:
     """Rebuilds the per-pixel mean raster for every (product, metric) from
     `result.scene_cache`, restricted to scenes that pass the given quality
     thresholds and aren't in `excluded_keys` - purely in-memory, no DEA
     request, so this is cheap enough to call on every Streamlit rerun as
-    the user adjusts filters or excludes/re-includes scenes."""
+    the user adjusts filters or excludes/re-includes scenes.
+
+    NDSI's raster is gated separately from the other four metrics, using
+    filter_scene_df(..., metric="NDSI")'s broader kept-scene set - a scene
+    that fails the vegetation-index valid-pixel gate (e.g. fully
+    snow-covered) can still be a perfectly good NDSI scene, so it shouldn't
+    be silently missing from the NDSI raster just because it's excluded
+    from the NDVI/tasselled-cap ones."""
     excluded_keys = excluded_keys or set()
-    kept_df = filter_scene_df(
-        result.scene_df, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct, excluded_keys
+    veg_kept_df = filter_scene_df(
+        result.scene_df, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct,
+        excluded_keys, metric=None, snow_method=snow_method,
     )
-    kept_keys = set(scene_key(r.product, r.item_id) for r in kept_df.itertuples())
+    veg_kept_keys = set(scene_key(r.product, r.item_id) for r in veg_kept_df.itertuples())
+    ndsi_kept_df = filter_scene_df(
+        result.scene_df, min_valid_pct, max_snow_pct, max_cloud_pct, max_smoke_pct,
+        excluded_keys, metric="NDSI", snow_method=snow_method,
+    )
+    ndsi_kept_keys = set(scene_key(r.product, r.item_id) for r in ndsi_kept_df.itertuples())
 
     accum: dict = {}
     for key, entry in result.scene_cache.items():
-        if key not in kept_keys:
-            continue
         for metric, arr in entry.metrics.items():
+            kept_keys = ndsi_kept_keys if metric == "NDSI" else veg_kept_keys
+            if key not in kept_keys:
+                continue
             acc_key = (entry.product_code, metric)
             acc = accum.get(acc_key)
             if acc is None:
@@ -776,7 +933,7 @@ def recompute_pixel_rasters(
 
 
 def fetch_single_scene(
-    result: AnalysisResult, product_code: str, item_id: str, buffer_m: float = SCENE_VIEW_BUFFER_M
+    result: AnalysisResult, product_code: str, item_id: str, buffer_m: Optional[float] = None
 ) -> dict:
     """Re-fetches and clips just one already-known scene (looked up from
     `result.stac_items`, populated by run_analysis) - used by tab 3's
@@ -785,6 +942,10 @@ def fetch_single_scene(
     blue stack (h, w, 3) - deliberately NOT masked to only-valid pixels,
     so cloud/haze/smoke is visible in the true-colour view rather than
     hidden by the same mask that excludes it from the index statistics.
+    `metrics` includes "NDSI" (computed over its own broader mask - see
+    NDSI_VALID_FMASK_CLASSES) alongside the vegetation indices, whenever
+    green/swir1 are available, regardless of whether the vegetation-index
+    mask found any valid pixels for this scene.
 
     Unlike the rest of this module, which only ever needs pixels strictly
     inside the polygon, the returned raster is clipped to a square
@@ -794,8 +955,10 @@ def fetch_single_scene(
     when a user inspects one scene, not for any statistic. The polygon
     mask (`polygon_mask`, used to draw/exclude the "in polygon" area) is
     still computed from the polygon's own true geometry, unaffected by the
-    wider fetch extent. Pass `buffer_m=0` to fall back to the old
-    tight-crop behaviour."""
+    wider fetch extent. `buffer_m=None` (the default) aims for a 2km x 2km
+    square via `_scene_view_buffer_m()`, falling back to a flat 200m buffer
+    once the polygon itself is already that big; pass an explicit value
+    (0 for the old tight-crop behaviour, or any other number) to override."""
     with open(result.products_json_path) as f:
         all_products = json.load(f)
     params = all_products[product_code]
@@ -808,6 +971,8 @@ def fetch_single_scene(
 
     roi_gdf = gpd.GeoDataFrame(geometry=[result.polygon_geom_wgs84], crs=WGS84)
     roi_projected = roi_gdf.to_crs(result.target_crs)
+    if buffer_m is None:
+        buffer_m = _scene_view_buffer_m(roi_gdf, result.target_crs)
     fetch_gdf = _buffered_square_gdf(roi_gdf, result.target_crs, buffer_m) if buffer_m > 0 else roi_gdf
     region_mgr = _SinglePolygonRegionManager(fetch_gdf, region_name=result.polygon_uid)
     product_mgr = RSDataProductManager(product_code, product_param_path=result.products_json_path)
@@ -864,13 +1029,24 @@ def fetch_single_scene(
         fmask_arr = np.asarray(scene[fmask_var].values)
         raster_valid = raster_valid & (fmask_arr != NODATA_FMASK_CLASS)
     metric_valid = raster_valid
+    metric_valid_ndsi = raster_valid
     if fmask_arr is not None:
         metric_valid = raster_valid & np.isin(fmask_arr, FMASK_VALID_CLASSES)
+        # Broader than metric_valid - keeps the snow class, so NDSI can
+        # still be shown for a scene the vegetation-index mask excludes
+        # entirely (e.g. fully snow-covered). See NDSI_VALID_FMASK_CLASSES.
+        metric_valid_ndsi = raster_valid & np.isin(fmask_arr, NDSI_VALID_FMASK_CLASSES)
 
     metrics = {}
     if metric_valid.sum() > 0:
         refl = {c: np.where(metric_valid, a / REFLECTANCE_SCALE, np.nan) for c, a in raw_bands.items()}
         metrics = compute_indices(refl)
+    if metric_valid_ndsi.sum() > 0 and "green" in raw_bands and "swir1" in raw_bands:
+        refl_ndsi = {
+            "green": np.where(metric_valid_ndsi, raw_bands["green"] / REFLECTANCE_SCALE, np.nan),
+            "swir1": np.where(metric_valid_ndsi, raw_bands["swir1"] / REFLECTANCE_SCALE, np.nan),
+        }
+        metrics["NDSI"] = compute_ndsi(refl_ndsi)
 
     rgb = None
     if all(b in raw_bands for b in ("red", "green", "blue")):
@@ -879,5 +1055,5 @@ def fetch_single_scene(
 
     return dict(
         rgb=rgb, metrics=metrics, valid_mask=metric_valid, polygon_mask=pm,
-        transform=scene.rio.transform(), crs=scene.rio.crs,
+        transform=scene.rio.transform(), crs=scene.rio.crs, buffer_m=buffer_m,
     )
