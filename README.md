@@ -61,10 +61,11 @@ in more detail.
      NDSI snow threshold (default 0.4, the standard MODIS convention - see
      "Which snow detection method should I use?" below), and a batch size
      (scenes fetched at a time - keeps memory bounded on long date ranges or
-     a server with limited RAM). A long date range is also searched a few
-     years at a time and automatically retried if DEA's STAC gateway
-     returns a transient error (occasionally a 502/503/504 under load) -
-     see "What if the run fails with a STAC/gateway error?" below.
+     a server with limited RAM). A long date range is also searched - and
+     each batch of scenes fetched - a few years/batches at a time, with
+     automatic retries if DEA's STAC gateway or data endpoint returns a
+     transient error (a 502/503/504, or a network/DNS blip) - see "What if
+     the run fails with a STAC/gateway/network error?" below.
    - **Run analysis.** A progress bar tracks each sensor's batches. This is
      the only step that talks to DEA - everything in tab 3 works instantly
      from what gets cached here, with no further fetching. The summary
@@ -246,30 +247,58 @@ ramp, light to dark) - snow (high NDSI) reads as white/pale and bare
 ground/vegetation (low NDSI) reads as blue, matching how snow actually
 looks.
 
-## What if the run fails with a STAC/gateway error?
+## What if the run fails with a STAC/gateway/network error?
 
-A run over a long date range makes several requests to DEA's STAC catalogue
-to find out which scenes exist before fetching any of their pixels, and
-DEA's STAC gateway occasionally returns a transient error under load (a
-502/503/504, or a plain connection timeout) - not a problem with your
-request, just a server-side blip. Two things make this less painful than
-it sounds:
+A run over a long date range makes many requests to DEA - first to its STAC
+catalogue, to find out which scenes exist, then to fetch each batch's actual
+pixel data - and either step can occasionally hit a transient error under
+load: a 502/503/504, a plain connection timeout, or (observed on Streamlit
+Community Cloud) a DNS resolution failure ("Could not resolve host") reaching
+DEA's S3-backed data endpoint. None of these are a problem with your request,
+just a network/server-side blip. Three things make this less painful than it
+sounds:
 
-- **The search is already chunked and retried for you.** `run_analysis()`
-  searches a few years at a time (`STAC_SEARCH_CHUNK_YEARS` in
-  `modules/analysis.py`, default 3) rather than the whole date range in one
-  request, and retries each chunk up to `STAC_SEARCH_MAX_ATTEMPTS` times
-  (default 3, with a short backoff) if it hits exactly this kind of
-  transient error. A single flaky request now costs a retry of a few
-  years' worth of search, not the entire run.
-- **A chunk that still fails after every retry doesn't take the rest of
-  the run down with it.** It's skipped, and you get a specific warning
-  under tab 2's results panel telling you exactly which period is missing
-  scenes and why (rather than a bare stack trace and zero results) - the
-  scenes from every other period you searched still come through. If you
-  see one of these, the simplest fix is usually just running it again
-  (a gateway timeout is transient by definition), or narrowing the date
-  range if it keeps happening for the same period.
+- **Both the search and the actual data fetch are chunked/batched and
+  retried for you.** The STAC *search* is done a few years at a time
+  (`STAC_SEARCH_CHUNK_YEARS` in `modules/analysis.py`, default 3) rather
+  than the whole date range in one request, retrying each chunk up to
+  `STAC_SEARCH_MAX_ATTEMPTS` times (default 3, with a short backoff) on
+  exactly this kind of error. Each batch's actual raster *fetch* gets the
+  same treatment (`BATCH_FETCH_MAX_ATTEMPTS`, default 3) - this matters
+  more than it might sound: batches are chronological slices of a sorted
+  scene list, so a run of consecutive failures here wipes out a
+  contiguous stretch of the timeline (a real run once lost ~15 years of
+  Landsat data to exactly this, before batch-level retries were added),
+  not just scattered individual scenes.
+- **A chunk or batch that still fails after every retry doesn't take the
+  rest of the run down with it.** It's skipped, and you get a specific
+  warning under tab 2's results panel telling you exactly which period/
+  batch is missing scenes and why (rather than a bare stack trace and
+  zero results) - the scenes from every other period/batch still come
+  through. If you see one of these, the simplest fix is usually just
+  running it again (a gateway/DNS blip is transient by definition), or
+  narrowing the date range if it keeps happening for the same period.
+- **If you're missing a large, contiguous stretch of years** (rather than
+  a handful of scattered scenes), check tab 2's warning panel for a run
+  of consecutive "batch N/M: failed to fetch/process" warnings for the
+  same sensor - that's the signature of a network blip that outlasted
+  even the retries (e.g. a longer DNS outage), and re-running the same
+  date range afterward should pick that stretch back up.
+- **If the run looks stuck rather than erroring out** (no new progress
+  text for minutes, no warnings appearing), that used to be a real gap:
+  neither `requests` nor `pystac_client` (which the STAC search goes
+  through) set a network timeout by default, so a connection that was
+  mid-request when your internet dropped could hang indefinitely - the
+  retry logic above only ever gets a chance to run *after* a request
+  raises an exception, and an unbounded hang never does. `modules/
+  analysis.py` now sets a process-wide 60s socket timeout
+  (`STAC_SOCKET_TIMEOUT_S`) specifically so this can't happen any more -
+  a hung STAC search connection now times out and gets retried (or
+  reported) like any other transient error, rather than leaving the app
+  looking stalled with no way to tell from the outside. This only covers
+  the STAC search step (Python's own `socket` module); the actual raster
+  fetch uses GDAL/rasterio's own networking stack and is covered instead
+  by `BATCH_FETCH_MAX_ATTEMPTS`'s retry loop, above.
 
 ## Is the live-filtering cache a memory problem on a server?
 

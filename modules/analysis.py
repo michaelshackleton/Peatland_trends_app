@@ -67,6 +67,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -95,6 +96,25 @@ from .smoke_detection import (  # noqa: E402
     build_clear_sky_reference,
     scene_smoke_pct,
 )
+
+# Neither `requests` nor `pystac_client` (which the STAC *search* step goes
+# through - see vendor/rs_data.py's get_stac_items) set a network timeout by
+# default. That means a connection that was mid-request when the internet
+# drops can block indefinitely waiting for a response that will never come -
+# and since the retry logic below (and fetch_single_scene()'s single-scene
+# fetch) only ever gets a chance to run *after* a request raises an
+# exception, an unbounded hang never reaches it; it just sits there. Setting
+# a process-wide default socket timeout turns that silent, indefinite hang
+# into a normal, raised TimeoutError after STAC_SOCKET_TIMEOUT_S seconds -
+# generous enough for DEA's STAC gateway's normal latency, but bounded, so
+# a genuinely dead connection is detected and retried (or reported) instead
+# of leaving the app looking stuck with no way to tell. This only affects
+# Python's own `socket` module (i.e. the STAC search calls); GDAL/rasterio's
+# actual raster reads use their own libcurl networking stack, unaffected by
+# this - that path is defended separately by BATCH_FETCH_MAX_ATTEMPTS's
+# retry loop instead (see run_analysis()'s main loop).
+STAC_SOCKET_TIMEOUT_S = 60.0
+socket.setdefaulttimeout(STAC_SOCKET_TIMEOUT_S)
 
 WGS84 = "EPSG:4326"
 REFLECTANCE_SCALE = 10000.0
@@ -152,6 +172,19 @@ STAC_SEARCH_CHUNK_YEARS = 3
 STAC_SEARCH_MAX_ATTEMPTS = 3
 STAC_SEARCH_RETRY_BACKOFF_S = 3.0
 
+# The STAC *search* step above already retries on a transient error, but
+# the actual per-batch raster fetch in run_analysis()'s main loop
+# (stac_items_to_xrdataset / make_product_dask - reading the pixel data
+# itself from DEA's S3-backed store) did not, until a run on Streamlit
+# Community Cloud lost roughly 15 years of Landsat data to a run of
+# consecutive "Could not resolve host" (DNS) failures: since batches are
+# chronological slices of a sorted item list, a stretch of consecutive
+# batch failures wipes out a contiguous stretch of the timeline, not just
+# scattered individual scenes - so this needed the same retry treatment as
+# the search step, not a smaller one.
+BATCH_FETCH_MAX_ATTEMPTS = 3
+BATCH_FETCH_RETRY_BACKOFF_S = 5.0
+
 # `filter_stac_items_region_overlap` (vendor/rs_data.py) computes each
 # candidate scene's coverage as (intersection area of the STAC item's
 # footprint polygon with the ROI) / (ROI area), then keeps the scene only if
@@ -173,11 +206,36 @@ STAC_SEARCH_RETRY_BACKOFF_S = 3.0
 FULL_COVERAGE_EPSILON = 0.001
 
 
-def _is_transient_stac_error(exc: Exception) -> bool:
-    """True for errors worth retrying (server-side hiccups) rather than
-    giving up on a chunk immediately."""
-    msg = str(exc)
-    return any(needle in msg for needle in ("502", "503", "504", "Timeout", "Timed out", "Connection"))
+def _is_transient_network_error(exc: Exception) -> bool:
+    """True for errors worth retrying (a network/DNS/server-side hiccup,
+    not a genuine problem with the request itself) rather than giving up
+    immediately. Used both for the STAC *search* retries below and for
+    retrying a batch's actual raster fetch (see run_analysis's main loop) -
+    DNS resolution failures ("Could not resolve host") are included
+    because they've been observed on Streamlit Community Cloud as a brief,
+    self-resolving DNS-resolver hiccup reaching DEA's S3-backed data
+    endpoint, not a real, lasting network outage. This matters most for the
+    per-batch fetch: unlike the STAC search step (already chunked and
+    retried), a batch's raster fetch previously had no retry at all, so a
+    short DNS blip there would silently drop every scene in every batch it
+    touched for the rest of a run - potentially years of data, since
+    batches are chronological slices of a sorted item list, so a run of
+    consecutive failures wipes out a contiguous stretch of the timeline.
+    Also matches the plain `TimeoutError`/"timed out" that
+    `socket.setdefaulttimeout()` (see STAC_SOCKET_TIMEOUT_S above) now
+    raises for a connection that hangs rather than erroring outright -
+    case-insensitive, since exact wording/casing varies across urllib3,
+    requests, and the underlying socket/curl layers."""
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "502", "503", "504", "timeout", "timed out", "connection",
+            "could not resolve host", "name or service not known",
+            "temporary failure in name resolution", "network is unreachable",
+            "curl error",
+        )
+    )
 
 
 def _date_chunks(start_date: str, end_date: str, chunk_years: int) -> list[tuple[str, str]]:
@@ -223,7 +281,7 @@ def _search_stac_items(
                 break
             except Exception as e:
                 last_exc = e
-                if attempt < STAC_SEARCH_MAX_ATTEMPTS - 1 and _is_transient_stac_error(e):
+                if attempt < STAC_SEARCH_MAX_ATTEMPTS - 1 and _is_transient_network_error(e):
                     time.sleep(STAC_SEARCH_RETRY_BACKOFF_S * (attempt + 1))
                     continue
                 break
@@ -454,7 +512,11 @@ def run_analysis(
     date range searched in one request is exactly the kind of thing DEA's
     STAC gateway occasionally 504s on, and losing an entire multi-decade
     search over one flaky request would be a bad trade for a retry that
-    usually just works.
+    usually just works. Each batch's actual raster fetch is retried the
+    same way (up to BATCH_FETCH_MAX_ATTEMPTS times) on the same class of
+    transient error, including DNS resolution failures - see
+    _is_transient_network_error()'s docstring for why this matters even
+    more here than for the search step.
     """
     if not product_codes:
         raise ValueError("Select at least one of Landsat / Sentinel-2.")
@@ -524,13 +586,39 @@ def run_analysis(
             frac = (p_idx + (b / n_batches)) / n_products
             report(f"{sensor_label}: batch {b + 1}/{n_batches} ({len(batch_items)} scenes)...", frac)
 
-            try:
-                xr_ds = stac_mgr.stac_items_to_xrdataset(
-                    batch_items, product_mgr, region_mgr, target_crs=target_crs
+            # Retried up to BATCH_FETCH_MAX_ATTEMPTS times on a transient
+            # network/DNS error (see _is_transient_network_error) before
+            # this batch is given up on - a short DNS/connection blip here
+            # would otherwise silently drop every scene in this batch, and
+            # since batches are chronological slices of a sorted item list,
+            # a run of consecutive failures wipes out a contiguous stretch
+            # of the timeline rather than scattered individual scenes.
+            last_batch_exc = None
+            for attempt in range(BATCH_FETCH_MAX_ATTEMPTS):
+                try:
+                    xr_ds = stac_mgr.stac_items_to_xrdataset(
+                        batch_items, product_mgr, region_mgr, target_crs=target_crs
+                    )
+                    processed = product_mgr.make_product_dask(xr_ds, region_mgr, compute=True)
+                    last_batch_exc = None
+                    break
+                except Exception as e:
+                    last_batch_exc = e
+                    if attempt < BATCH_FETCH_MAX_ATTEMPTS - 1 and _is_transient_network_error(e):
+                        report(
+                            f"{sensor_label}: batch {b + 1}/{n_batches} hit a transient error, "
+                            f"retrying ({attempt + 1}/{BATCH_FETCH_MAX_ATTEMPTS})...", frac,
+                        )
+                        time.sleep(BATCH_FETCH_RETRY_BACKOFF_S * (attempt + 1))
+                        continue
+                    break
+            if last_batch_exc is not None:
+                warnings.append(
+                    f"{sensor_label} batch {b + 1}/{n_batches}: failed to fetch/process after "
+                    f"{BATCH_FETCH_MAX_ATTEMPTS} attempt(s) - {last_batch_exc}. Scenes from this "
+                    "batch will be missing from this run; try running again (a network/DNS blip "
+                    "is usually transient)."
                 )
-                processed = product_mgr.make_product_dask(xr_ds, region_mgr, compute=True)
-            except Exception as e:
-                warnings.append(f"{sensor_label} batch {b + 1}/{n_batches}: failed to fetch/process - {e}")
                 continue
 
             if "time" not in processed.dims:
