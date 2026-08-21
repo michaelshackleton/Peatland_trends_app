@@ -120,6 +120,38 @@ def to_phenology_month(calendar_month: int, month_order: list[int]) -> int:
     return month_order.index(calendar_month) + 1
 
 
+def to_phenology_doy(dt, month_order: list[int]) -> int:
+    """Timestamp -> x-axis position (1-based day-of-year, ~1-366) within
+    `month_order` - the day-level equivalent of to_phenology_month(), giving
+    every scene its own x position instead of bucketing it into one of 12
+    month slots. Day 1 is the first day of month_order[0] (Jan 1 for
+    calendar ordering, Jul 1 for water-year ordering). Uses real date
+    arithmetic (not modular day-of-year math) so it stays correct across
+    leap years and the water-year's Dec->Jan boundary."""
+    dt = pd.Timestamp(dt)
+    start_month = month_order[0]
+    year = dt.year if dt.month >= start_month else dt.year - 1
+    start = pd.Timestamp(year=year, month=start_month, day=1)
+    return int((dt.normalize() - start).days) + 1
+
+
+def phenology_month_positions(month_order: list[int]) -> dict[int, tuple[int, int]]:
+    """For each calendar month in `month_order`, returns (start_day, mid_day)
+    - 1-based day-of-year positions on the same scale as to_phenology_doy(),
+    for that month's first day and approximate midpoint. Computed from a
+    fixed non-leap reference year (2001) so tick marks and the monthly-mean
+    reference line don't wobble by a day depending on which actual years'
+    data is being summarised. Used for the phenology plot's month tick
+    marks (start_day) and its monthly-mean line (mid_day)."""
+    positions = {}
+    running = 1
+    for m in month_order:
+        days_in_month = calendar.monthrange(2001, m)[1]
+        positions[m] = (running, running + days_in_month // 2)
+        running += days_in_month
+    return positions
+
+
 def facet_rc(i: int, n_cols: int) -> tuple[int, int]:
     """0-based facet index -> (row, col) 1-based Plotly subplot coordinates,
     filling left-to-right then top-to-bottom - matches the order
@@ -530,8 +562,8 @@ with tab_home:
      scenes count toward the raster and plots below - snow % can be checked via fmask, NDSI, or a
      mixture of both.
    - A **pixel-mean raster** map shows the average value per pixel over your polygon, per sensor.
-   - A **time series** and a **phenology plot** (seasonal pattern, by month) both support optional
-     linear and GAM-smoothed trend lines.
+   - A **time series** and a **phenology plot** (seasonal pattern, by day of year) both support
+     optional linear and GAM-smoothed trend lines.
    - Click a point on the time series to fetch and view that one scene's imagery (true colour or
      the current metric), download it as a GeoTIFF, or exclude it from the analysis.
    - A per-scene data table lets you review everything fetched and download it as CSV.
@@ -1237,20 +1269,23 @@ with tab_results:
 
         # ---- Phenology ------------------------------------------------------
         st.divider()
-        st.subheader("Phenology - mean value by month")
+        st.subheader("Phenology - mean value by day of year")
         phen_month_order = phenology_month_order(metric)
+        phen_month_positions = phenology_month_positions(phen_month_order)
         if metric == "NDSI":
             st.caption(
-                "Every scene passing the quality filters above, across all years, plotted by month, "
-                "running January -> December - the alpine snow season (roughly June-October) stays "
-                "together in one block this way, unlike the water-year ordering used for the other "
-                "metrics. Shows the within-year seasonal pattern independent of any long-term trend."
+                "Every scene passing the quality filters above, across all years, plotted by its actual "
+                "day of year, running January -> December - the alpine snow season (roughly "
+                "June-October) stays together in one block this way, unlike the water-year ordering "
+                "used for the other metrics. Shows the within-year seasonal pattern independent of any "
+                "long-term trend."
             )
         else:
             st.caption(
-                "Every scene passing the quality filters above, across all years, plotted by month, "
-                "running July -> June to keep the (Southern Hemisphere) growing season together in one "
-                "block - shows the within-year seasonal pattern independent of any long-term trend."
+                "Every scene passing the quality filters above, across all years, plotted by its actual "
+                "day of year, running July -> June to keep the (Southern Hemisphere) growing season "
+                "together in one block - shows the within-year seasonal pattern independent of any "
+                "long-term trend."
             )
         phen_src = kept_df.dropna(subset=[mean_col]).copy()
         if len(phen_src) == 0:
@@ -1258,7 +1293,7 @@ with tab_results:
         else:
             phen_src["datetime"] = pd.to_datetime(phen_src["datetime"])
             phen_src["month"] = phen_src["datetime"].dt.month
-            phen_src["water_month"] = phen_src["month"].apply(lambda m: to_phenology_month(m, phen_month_order))
+            phen_src["water_doy"] = phen_src["datetime"].apply(lambda dt: to_phenology_doy(dt, phen_month_order))
             phen_src["year"] = phen_src["datetime"].dt.year
             phen_src["month_abbr"] = phen_src["month"].apply(lambda mo: calendar.month_abbr[mo])
 
@@ -1303,7 +1338,7 @@ with tab_results:
                         for yr, sub in phen_plot.groupby("year"):
                             fig_phen.add_trace(
                                 go.Scatter(
-                                    x=sub["water_month"], y=sub[mean_col], mode="markers", name=str(yr),
+                                    x=sub["water_doy"], y=sub[mean_col], mode="markers", name=str(yr),
                                     marker=dict(
                                         size=7, opacity=0.65, color=year_colors.get(yr),
                                         symbol=[SENSOR_SYMBOLS.get(s, "circle") for s in sub["sensor"]],
@@ -1318,7 +1353,7 @@ with tab_results:
                         for s, sub in phen_plot.groupby("sensor"):
                             fig_phen.add_trace(
                                 go.Scatter(
-                                    x=sub["water_month"], y=sub[mean_col], mode="markers", name=s,
+                                    x=sub["water_doy"], y=sub[mean_col], mode="markers", name=s,
                                     marker=dict(size=7, opacity=0.6, symbol=SENSOR_SYMBOLS.get(s, "circle")),
                                     customdata=sub[["year", "month_abbr"]].values,
                                     hovertemplate="%{customdata[1]} %{customdata[0]}<br>Value %{y:.3f}<extra></extra>",
@@ -1326,10 +1361,11 @@ with tab_results:
                             )
                         phen_legend_title = "Sensor"
 
-                    monthly_mean = phen_plot.groupby("water_month")[mean_col].mean().reindex(range(1, 13))
+                    monthly_mean = phen_plot.groupby("month")[mean_col].mean().reindex(phen_month_order)
                     fig_phen.add_trace(
                         go.Scatter(
-                            x=monthly_mean.index, y=monthly_mean.values, mode="lines+markers",
+                            x=[phen_month_positions[m][1] for m in monthly_mean.index],
+                            y=monthly_mean.values, mode="lines+markers",
                             name="Monthly mean (selected years)",
                             line=dict(color="black", width=2), marker=dict(size=8, symbol="diamond"),
                         )
@@ -1338,7 +1374,7 @@ with tab_results:
                     if phen_trend_mode == "Separate per year":
                         linear_fail_years, gam_fail_years = [], []
                         for yr, sub in phen_plot.groupby("year"):
-                            x_yr = sub["water_month"].astype(float).values
+                            x_yr = sub["water_doy"].astype(float).values
                             y_yr = sub[mean_col].values
                             trend_color = year_colors.get(yr, "#2C3E50")
                             if phen_linear_on:
@@ -1375,10 +1411,10 @@ with tab_results:
                                 "Could not fit a GAM trend: " + ", ".join(str(y) for y in gam_fail_years) + "."
                             )
                     else:
-                        x_month = phen_plot["water_month"].astype(float).values
+                        x_doy = phen_plot["water_doy"].astype(float).values
                         y_val = phen_plot[mean_col].values
                         if phen_linear_on:
-                            lt = trends.linear_trend(x_month, y_val)
+                            lt = trends.linear_trend(x_doy, y_val)
                             if lt is not None:
                                 fig_phen.add_trace(
                                     go.Scatter(
@@ -1389,14 +1425,14 @@ with tab_results:
                                 mid_i = len(lt.x) // 2
                                 fig_phen.add_annotation(
                                     x=lt.x[mid_i], y=lt.y[mid_i],
-                                    text=f"Slope = {lt.slope_per_day:+.4f} / month (R²={lt.r2:.2f})",
+                                    text=f"Slope = {lt.slope_per_day:+.4f} / day (R²={lt.r2:.2f})",
                                     showarrow=True, arrowhead=1, ax=0, ay=-35,
                                     font=dict(color="#2C3E50", size=12),
                                 )
                             else:
                                 st.caption("Not enough points for a linear trend.")
                         if phen_gam_on:
-                            x_grid, y_grid, gam_error = trends.gam_trend(x_month, y_val)
+                            x_grid, y_grid, gam_error = trends.gam_trend(x_doy, y_val)
                             if gam_error is None:
                                 fig_phen.add_trace(
                                     go.Scatter(
@@ -1415,7 +1451,8 @@ with tab_results:
                         )
                     fig_phen.update_layout(
                         xaxis=dict(
-                            title="Month", tickmode="array", tickvals=list(range(1, 13)),
+                            title="Month", tickmode="array",
+                            tickvals=[phen_month_positions[m][0] for m in phen_month_order],
                             ticktext=[calendar.month_abbr[m] for m in phen_month_order],
                         ),
                         yaxis_title=METRIC_LABELS.get(metric, metric), height=520,
@@ -1698,23 +1735,25 @@ with tab_compare:
 
                     # ---- Phenology (faceted, one subplot per dataset) ------------
                     st.divider()
-                    st.markdown("**Phenology - mean value by month**")
+                    st.markdown("**Phenology - mean value by day of year**")
                     cmp_phen_month_order = phenology_month_order(cmp_metric)
+                    cmp_phen_month_positions = phenology_month_positions(cmp_phen_month_order)
                     if cmp_metric == "NDSI":
                         st.caption(
-                            "Every point across all years, by month, running January -> December (keeps "
-                            "the alpine snow season together in one block), one facet per dataset - same "
-                            "as tab 3's phenology plot, fit and drawn separately per dataset."
+                            "Every point across all years, by actual day of year, running January -> "
+                            "December (keeps the alpine snow season together in one block), one facet "
+                            "per dataset - same as tab 3's phenology plot, fit and drawn separately per "
+                            "dataset."
                         )
                     else:
                         st.caption(
-                            "Every point across all years, by month, running July -> June (Southern "
-                            "Hemisphere growing season), one facet per dataset - same as tab 3's phenology "
-                            "plot, fit and drawn separately per dataset."
+                            "Every point across all years, by actual day of year, running July -> June "
+                            "(Southern Hemisphere growing season), one facet per dataset - same as tab "
+                            "3's phenology plot, fit and drawn separately per dataset."
                         )
                     phen_df_all = plot_df.copy()
-                    phen_df_all["water_month"] = phen_df_all["month"].apply(
-                        lambda m: to_phenology_month(m, cmp_phen_month_order)
+                    phen_df_all["water_doy"] = phen_df_all["datetime"].apply(
+                        lambda dt: to_phenology_doy(dt, cmp_phen_month_order)
                     )
                     phen_df_all["year"] = phen_df_all["datetime"].dt.year
                     phen_df_all["month_abbr"] = phen_df_all["month"].apply(lambda mo: calendar.month_abbr[mo])
@@ -1794,7 +1833,7 @@ with tab_compare:
                                         symbol = SENSOR_SYMBOLS.get(group_val, "circle")
                                     fig_phen_cmp.add_trace(
                                         go.Scatter(
-                                            x=g["water_month"], y=g[cmp_mean_col], mode="markers", name=name,
+                                            x=g["water_doy"], y=g[cmp_mean_col], mode="markers", name=name,
                                             legendgroup=name, showlegend=show,
                                             marker=dict(
                                                 size=6, opacity=0.65, symbol=symbol,
@@ -1807,12 +1846,13 @@ with tab_compare:
                                         row=r, col=c,
                                     )
 
-                                monthly_mean = sub_ds.groupby("water_month")[cmp_mean_col].mean().reindex(range(1, 13))
+                                monthly_mean = sub_ds.groupby("month")[cmp_mean_col].mean().reindex(cmp_phen_month_order)
                                 mm_show = "Monthly mean" not in seen_legend_names
                                 seen_legend_names.add("Monthly mean")
                                 fig_phen_cmp.add_trace(
                                     go.Scatter(
-                                        x=monthly_mean.index, y=monthly_mean.values, mode="lines+markers",
+                                        x=[cmp_phen_month_positions[m][1] for m in monthly_mean.index],
+                                        y=monthly_mean.values, mode="lines+markers",
                                         name="Monthly mean", legendgroup="monthly_mean", showlegend=mm_show,
                                         line=dict(color="black", width=2), marker=dict(size=6, symbol="diamond"),
                                     ),
@@ -1821,7 +1861,7 @@ with tab_compare:
 
                                 if cmp_phen_trend_mode == "Separate per year":
                                     for yr, sub_yr in sub_ds.groupby("year"):
-                                        x_yr = sub_yr["water_month"].astype(float).values
+                                        x_yr = sub_yr["water_doy"].astype(float).values
                                         y_yr = sub_yr[cmp_mean_col].values
                                         trend_color = year_color_map.get(yr, "#2C3E50")
                                         if cmp_phen_linear_on:
@@ -1857,10 +1897,10 @@ with tab_compare:
                                             else:
                                                 phen_gam_fails.append(f"{ds} {yr} ({err})")
                                 else:
-                                    x_month = sub_ds["water_month"].astype(float).values
+                                    x_doy = sub_ds["water_doy"].astype(float).values
                                     y_val = sub_ds[cmp_mean_col].values
                                     if cmp_phen_linear_on:
-                                        lt = trends.linear_trend(x_month, y_val)
+                                        lt = trends.linear_trend(x_doy, y_val)
                                         if lt is not None:
                                             fig_phen_cmp.add_trace(
                                                 go.Scatter(
@@ -1872,14 +1912,14 @@ with tab_compare:
                                             )
                                             mid_i = len(lt.x) // 2
                                             fig_phen_cmp.add_annotation(
-                                                x=lt.x[mid_i], y=lt.y[mid_i], text=f"{lt.slope_per_day:+.4f}/mo",
+                                                x=lt.x[mid_i], y=lt.y[mid_i], text=f"{lt.slope_per_day:+.4f}/day",
                                                 showarrow=True, arrowhead=1, ax=0, ay=-25,
                                                 font=dict(color="#2C3E50", size=10), row=r, col=c,
                                             )
                                         else:
                                             phen_linear_fails.append(ds)
                                     if cmp_phen_gam_on:
-                                        xg, yg, err = trends.gam_trend(x_month, y_val)
+                                        xg, yg, err = trends.gam_trend(x_doy, y_val)
                                         if err is None:
                                             fig_phen_cmp.add_trace(
                                                 go.Scatter(
@@ -1900,7 +1940,8 @@ with tab_compare:
                             # Shared axes across facets here too - see the same note on fig_trends
                             # above.
                             fig_phen_cmp.update_xaxes(
-                                tickmode="array", tickvals=list(range(1, 13)),
+                                tickmode="array",
+                                tickvals=[cmp_phen_month_positions[m][0] for m in cmp_phen_month_order],
                                 ticktext=[calendar.month_abbr[m] for m in cmp_phen_month_order],
                                 title_text="Month", matches="x",
                             )
