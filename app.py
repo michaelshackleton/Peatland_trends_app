@@ -81,6 +81,12 @@ MAX_VIEWED_SCENES = 5
 
 SENSOR_SYMBOLS = {"Landsat": "circle", "Sentinel-2": "diamond"}
 
+# Tab 3's "Inspect scene(s)" viewer: the extra display mode that shows a
+# binary snow/not-snow mask (NDSI thresholded at fetch time) rather than
+# the continuous metric layer - independent of the "Metric" selector above
+# it, since you may want to see snow-covered pixels while looking at NDVI.
+SNOW_MASK_VIEW_LABEL = "Snow-covered pixels (NDSI-based)"
+
 
 def _month_color(m: int) -> str:
     h = (m - 1) / 12.0
@@ -1072,6 +1078,387 @@ with tab_results:
 
             render_scene_selection_actions(sel_scenes, result, key_prefix="ts")
 
+        # ---- Snow cover & melt-out dates -----------------------------------
+        # Independent of the "Metric" selector above - always NDSI-based,
+        # since that's the whole point of this section regardless of which
+        # metric's raster/time-series the user is currently looking at.
+        st.divider()
+        st.subheader("Snow cover & melt-out dates")
+        if "snow_pct_ndsi" not in df_all.columns:
+            st.info(
+                "This analysis run predates the NDSI snow columns (snow_pct_ndsi) - re-run the "
+                "fetch in tab 2 to get them."
+            )
+        else:
+            st.caption(
+                "Per-scene snow cover (% of the polygon's pixels with NDSI above the fetch-time "
+                "threshold - tab 2's 'Advanced fetch options') over the melt season, used to "
+                "estimate the date each snow-cover threshold from 100% down to 0% is crossed on "
+                "the way down, per year."
+            )
+            snow_col = "snow_pct_ndsi"
+            ndsi_threshold_used = result.fetch_params.get(
+                "ndsi_snow_threshold", analysis.DEFAULT_NDSI_SNOW_THRESHOLD
+            )
+
+            # Same cloud/smoke/valid-pixel quality gate as the rest of this
+            # tab (via NDSI's own snow-inclusive valid-pixel columns), but
+            # deliberately max_snow_pct=100 regardless of the "Maximum scene
+            # snow cover" slider above - that slider exists to *reject*
+            # heavily snow-covered scenes for the vegetation indices, which
+            # is exactly the data this section needs to see a 100% start.
+            snow_df = analysis.filter_scene_df(
+                df_all, min_valid_pct, 100.0, max_cloud_pct, max_smoke_pct, excluded_keys,
+                metric="NDSI", snow_method="ndsi",
+            ).copy()
+            snow_df["datetime"] = pd.to_datetime(snow_df["datetime"])
+            snow_df["year"] = snow_df["datetime"].dt.year
+            snow_df["month"] = snow_df["datetime"].dt.month
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1:
+                season_months = st.multiselect(
+                    "Snow season months", options=list(range(1, 13)),
+                    default=[5, 6, 7, 8, 9, 10, 11], format_func=lambda m: calendar.month_abbr[m],
+                    key="snow_season_months",
+                    help="Restricts which months count as one melt season (default May-November, "
+                    "around the Jul-Oct alpine snow season with margin either side) - scenes outside "
+                    "this window are excluded from the crossing-date calculation below, so an "
+                    "off-season cloud/NDSI misfire can't be mistaken for a melt event.",
+                )
+            with sc2:
+                threshold_step = st.select_slider(
+                    "Threshold step (%)", options=[5, 10, 20, 25], value=10, key="snow_threshold_step",
+                )
+            with sc3:
+                melt_start_decline_pp = st.number_input(
+                    "Melt-start decline (pp)", min_value=1.0, max_value=50.0,
+                    value=5.0, step=1.0, key="snow_melt_start_decline",
+                    help="Melting is considered to have 'started' the first/last (see 'Which decline "
+                    "to report' below) time snow cover drops this many percentage points below the "
+                    "season's peak - not the exact peak date itself, since scenes often plateau near "
+                    "the peak for a while before any real decline begins.",
+                )
+            with sc4:
+                melt_out_pct = st.number_input(
+                    "Melt-out threshold (%)", min_value=0.0, max_value=50.0,
+                    value=float(analysis.DEFAULT_MELT_OUT_THRESHOLD_PCT), step=1.0, key="snow_melt_out_pct",
+                    help="Snow % below which the polygon is considered melted out for the headline "
+                    "date below - not literally 0%, since a few misclassified pixels can keep a bare "
+                    "polygon's NDSI-based snow_pct hovering just above zero.",
+                )
+            crossing_mode_label = st.radio(
+                "Which decline to report for each threshold/date",
+                [
+                    "Last decline before it stays below (recommended - skips earlier re-snow bounces)",
+                    "First decline (earliest time it ever dropped below)",
+                ],
+                index=0, horizontal=False, key="snow_crossing_mode",
+                help="A polygon can dip and re-snow one or more times before its final, sustained "
+                "melt - e.g. an early-season partial melt that re-freezes. 'Last decline' reports the "
+                "crossing tied to the final drop-and-stay-below, which is usually what 'the actual "
+                "melt date' means. 'First decline' reports the earliest time it ever dropped below "
+                "each level, even if it recovered afterwards - useful for studying early/partial melt "
+                "events specifically, not for a single headline melt date.",
+            )
+            crossing_mode = "last" if crossing_mode_label.startswith("Last") else "first"
+            thresholds = sorted(set(list(range(100, -1, -threshold_step)) + [0]), reverse=True)
+
+            season_df = snow_df[snow_df["month"].isin(season_months)] if season_months else snow_df.iloc[0:0]
+            years = sorted(season_df["year"].unique())
+
+            if not season_months:
+                st.info("Select at least one snow-season month above.")
+            elif not years:
+                st.info("No scenes fall in the selected season months/quality filters.")
+            else:
+                # ---- Per-year summary table -----------------------------
+                summary_rows = []
+                per_year_crossings = {}
+                for yr in years:
+                    yr_df = season_df[season_df["year"] == yr].sort_values("datetime")
+                    per_year_crossings[yr] = analysis.snow_threshold_crossings(
+                        yr_df["datetime"], yr_df[snow_col], thresholds=thresholds, mode=crossing_mode
+                    )
+                    peak_pct = float(yr_df[snow_col].max())
+                    peak_idx = yr_df[snow_col].idxmax()
+                    peak_date = yr_df.loc[peak_idx, "datetime"]
+                    peak_sensor = yr_df.loc[peak_idx, "sensor"] if "sensor" in yr_df.columns else None
+                    peak_pct_valid_ndsi = (
+                        float(yr_df.loc[peak_idx, "pct_valid_ndsi"]) if "pct_valid_ndsi" in yr_df.columns else np.nan
+                    )
+
+                    melt_start_threshold = max(peak_pct - melt_start_decline_pp, 0.0)
+                    melt_start_row = analysis.snow_threshold_crossings(
+                        yr_df["datetime"], yr_df[snow_col], thresholds=[melt_start_threshold], mode=crossing_mode
+                    ).iloc[0]
+                    melt_start_date = melt_start_row["crossing_date"]
+
+                    melt_row = analysis.snow_threshold_crossings(
+                        yr_df["datetime"], yr_df[snow_col], thresholds=[melt_out_pct], mode=crossing_mode
+                    ).iloc[0]
+                    melt_out_date = melt_row["crossing_date"]
+
+                    duration_days = (
+                        (melt_out_date - melt_start_date).days
+                        if pd.notna(melt_start_date) and pd.notna(melt_out_date) else np.nan
+                    )
+                    summary_rows.append(dict(
+                        year=yr,
+                        n_scenes=len(yr_df),
+                        peak_snow_pct=peak_pct,
+                        peak_date=peak_date,
+                        peak_sensor=peak_sensor,
+                        peak_pct_valid_ndsi=peak_pct_valid_ndsi,
+                        melt_start_date=melt_start_date,
+                        melt_start_status=analysis.MELT_STATUS_LABELS.get(
+                            melt_start_row["status"], melt_start_row["status"]
+                        ),
+                        melt_start_doy=melt_start_date.dayofyear if pd.notna(melt_start_date) else np.nan,
+                        melt_out_date=melt_out_date,
+                        melt_out_status=analysis.MELT_STATUS_LABELS.get(melt_row["status"], melt_row["status"]),
+                        melt_out_doy=melt_out_date.dayofyear if pd.notna(melt_out_date) else np.nan,
+                        melt_duration_days=duration_days,
+                    ))
+                summary_df = pd.DataFrame(summary_rows)
+
+                st.markdown("**Per-year summary**")
+                display_summary = summary_df.drop(columns=["melt_start_doy", "melt_out_doy"]).copy()
+                for _c in ("peak_date", "melt_start_date", "melt_out_date"):
+                    display_summary[_c] = pd.to_datetime(display_summary[_c]).dt.date
+                st.dataframe(display_summary, use_container_width=True, hide_index=True)
+                _mode_phrase = "last (final, sustained)" if crossing_mode == "last" else "first"
+                st.caption(
+                    f"'Melt start' = the {_mode_phrase} date snow cover drops the configured number "
+                    "of percentage points below that year's peak. 'Melt duration' = days between melt "
+                    "start and melt-out; blank when either date wasn't reached (see the status "
+                    "columns). Change 'Which decline to report' above to switch between the first "
+                    "and last qualifying decline. 'peak_pct_valid_ndsi' is the % of the polygon that "
+                    "was cloud/shadow-free on the peak scene - if this (and peak_snow_pct) is "
+                    "identical across many years, the polygon likely has a persistently "
+                    "cloud/shadow/nodata-affected area (e.g. a shaded slope, or a strip outside the "
+                    "usable data footprint) capping how much of it can ever register as snow, and the "
+                    "peak scenes each year happen to have the entire visible area snow-covered."
+                )
+
+                # Clean ISO date strings (not raw timestamps-with-microseconds) for the CSV -
+                # Excel/other spreadsheet apps can otherwise misparse a datetime string with
+                # sub-second precision, e.g. showing only a fragment like a bare "mm:ss.s" time
+                # instead of the full date. Sub-day precision from the interpolation isn't
+                # meaningful here anyway (scenes are typically days to weeks apart).
+                csv_df = summary_df.copy()
+                for _c in ("peak_date", "melt_start_date", "melt_out_date"):
+                    csv_df[_c] = pd.to_datetime(csv_df[_c]).apply(
+                        lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) else ""
+                    )
+                st.download_button(
+                    "Download per-year snow summary as CSV",
+                    csv_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{sel['uid']}_snow_melt_summary.csv",
+                    mime="text/csv",
+                    key="snow_summary_download",
+                )
+
+                # ---- Diagnostic: where is the persistently-excluded area? ----
+                with st.expander("Diagnose a capped/identical peak_snow_pct across years"):
+                    st.caption(
+                        "If peak_snow_pct (and peak_pct_valid_ndsi) above look suspiciously identical "
+                        "across several years, this builds a map of how often each pixel in the "
+                        "polygon was usable (cloud/shadow/nodata-free) across every cached scene of "
+                        "one product - not just the peak scenes. A pixel that's 0% valid the whole "
+                        "time range is structurally excluded (e.g. permanent terrain shadow, or "
+                        "outside the usable data footprint), not just unlucky with weather - that's "
+                        "what caps how high snow % can ever read. Clipped to the polygon's own "
+                        "interior (not the buffered viewing area around it), with the colour scale "
+                        "stretched to that interior's own range - a narrow/elongated polygon can have "
+                        "its real signal swamped by a much larger buffered background otherwise."
+                    )
+                    diag_products = sorted(season_df["product"].dropna().unique()) if "product" in season_df.columns else []
+                    if not diag_products:
+                        st.info("No product/sensor information available to diagnose.")
+                    else:
+                        diag_product = st.selectbox(
+                            "Product to check", diag_products, key="snow_diag_product",
+                            help="Pick the product your peak scenes usually come from (see 'peak_sensor' "
+                            "in the table above) - a persistent gap is specific to one product's grid.",
+                        )
+                        # Cached across reruns (keyed to this polygon+product) rather than only
+                        # existing inside the button's own script-run - st.button() is only True
+                        # on the exact rerun it was clicked, so without this the map would build,
+                        # render once, then vanish the moment any widget (including the map itself)
+                        # triggers Streamlit's next rerun.
+                        diag_cache_key = (sel["uid"], diag_product)
+                        if st.button("Build valid-observation map", key="snow_diag_button"):
+                            with st.spinner(f"Checking every cached {diag_product} scene..."):
+                                poly_mask = result.polygon_masks.get(diag_product) if result.polygon_masks else None
+                                freq_arr, transform, crs, n_used = analysis.persistent_valid_fraction(
+                                    result.scene_cache, diag_product, polygon_mask=poly_mask
+                                )
+                            st.session_state["snow_diag_cache"] = dict(
+                                key=diag_cache_key, freq_arr=freq_arr, transform=transform,
+                                crs=crs, n_used=n_used, clipped=poly_mask is not None,
+                            )
+
+                        cached = st.session_state.get("snow_diag_cache")
+                        if cached and cached["key"] == diag_cache_key:
+                            freq_arr, transform, crs, n_used, clipped = (
+                                cached["freq_arr"], cached["transform"], cached["crs"],
+                                cached["n_used"], cached["clipped"],
+                            )
+                            if freq_arr is None:
+                                st.warning(
+                                    f"No cached NDSI arrays found for product '{diag_product}' - "
+                                    "try a different product, or re-fetch in tab 2."
+                                )
+                            else:
+                                # Autoscale to the polygon interior's own range when it was
+                                # successfully clipped (this is the "rescale the colour range"
+                                # part); fall back to a fixed 0-1 scale if no mask was available
+                                # for this product (e.g. it wasn't fetched this session) so the
+                                # map still renders sensibly rather than failing.
+                                if clipped and np.any(np.isfinite(freq_arr)):
+                                    scale_vmin = float(np.nanmin(freq_arr))
+                                    scale_vmax = float(np.nanmax(freq_arr))
+                                else:
+                                    scale_vmin, scale_vmax = 0.0, 1.0
+                                layer_out = raster_viz.raster_overlay_layer(
+                                    freq_arr, transform, crs, "Fraction of scenes valid (NDSI)",
+                                    "RdYlGn", vmin=scale_vmin, vmax=scale_vmax, opacity=0.85,
+                                )
+                                if layer_out is None:
+                                    st.warning("Nothing finite to show in this array.")
+                                else:
+                                    data_uri, bounds, legend, _vmin, _vmax = layer_out
+                                    diag_map = folium.Map(tiles=None, control_scale=True)
+                                    folium.TileLayer(
+                                        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/"
+                                        "MapServer/tile/{z}/{y}/{x}",
+                                        attr="Esri", name="Satellite", overlay=False,
+                                    ).add_to(diag_map)
+                                    folium.raster_layers.ImageOverlay(
+                                        image=data_uri, bounds=bounds, name="Valid-observation frequency",
+                                    ).add_to(diag_map)
+                                    legend.add_to(diag_map)
+                                    diag_map.fit_bounds(bounds)
+                                    st_folium(diag_map, use_container_width=True, height=420, key="snow_diag_map")
+                                    finite_vals = freq_arr[np.isfinite(freq_arr)]
+                                    pct_always_invalid = (
+                                        float(np.mean(finite_vals <= 0.01)) * 100.0 if finite_vals.size else 0.0
+                                    )
+                                    clip_note = (
+                                        f"clipped to the polygon interior, colour scale stretched to "
+                                        f"{scale_vmin:.2f}-{scale_vmax:.2f}"
+                                        if clipped else
+                                        "not clipped (no saved polygon mask for this product - "
+                                        "background reads as 'never valid' too, ignore red outside "
+                                        "the polygon's actual shape)"
+                                    )
+                                    st.caption(
+                                        f"Built from {n_used} cached {diag_product} scene(s) across the "
+                                        f"whole fetched time range; {clip_note}. Dark red = least usable "
+                                        f"in this range (~{pct_always_invalid:.0f}% of this polygon's pixels sit "
+                                        "at/near 0%, i.e. never valid at all); dark green = usable in "
+                                        "nearly every scene."
+                                    )
+
+
+                # ---- Melt-out date trend across years --------------------
+                valid_trend = summary_df.dropna(subset=["melt_out_doy"])
+                if len(valid_trend) >= 2:
+                    fig_trend = go.Figure()
+                    fig_trend.add_trace(go.Scatter(
+                        x=valid_trend["year"], y=valid_trend["melt_out_doy"], mode="markers+lines",
+                        name=f"Melt-out day of year (<{melt_out_pct:.0f}% snow)",
+                        marker=dict(size=9, color="#2E86C1"),
+                    ))
+                    slope, intercept = np.polyfit(valid_trend["year"], valid_trend["melt_out_doy"], 1)
+                    fitted = slope * valid_trend["year"] + intercept
+                    fig_trend.add_trace(go.Scatter(
+                        x=valid_trend["year"], y=fitted, mode="lines", name=f"Trend ({slope:+.2f} days/yr)",
+                        line=dict(color="black", dash="dash"),
+                    ))
+                    fig_trend.update_layout(
+                        yaxis_title="Melt-out day of year", xaxis_title="Year", height=380,
+                        xaxis=dict(dtick=1),
+                    )
+                    st.plotly_chart(fig_trend, use_container_width=True)
+                    direction = "later" if slope > 0 else "earlier"
+                    st.caption(
+                        f"Melt-out is trending {abs(slope):.1f} days/year {direction} across "
+                        f"{len(valid_trend)} year(s) with a usable melt-out date. Treat cautiously "
+                        "with only a few years of data or gappy scene coverage."
+                    )
+                else:
+                    st.caption("Need at least 2 years with a usable melt-out date to show a trend.")
+
+                st.divider()
+                # ---- Single-year detail plot ------------------------------
+                detail_year = st.selectbox(
+                    "Year to inspect in detail", years, index=len(years) - 1, key="snow_detail_year",
+                )
+                yr_df = season_df[season_df["year"] == detail_year].sort_values("datetime")
+                crossings = per_year_crossings[detail_year]
+
+                fig_snow = go.Figure()
+                symbols = [SENSOR_SYMBOLS.get(s, "circle") for s in yr_df["sensor"]]
+                fig_snow.add_trace(go.Scatter(
+                    x=yr_df["datetime"], y=yr_df[snow_col], mode="lines+markers", name="Snow cover (NDSI)",
+                    marker=dict(size=9, symbol=symbols, color="#2E86C1", line=dict(width=1, color="rgba(0,0,0,0.4)")),
+                    customdata=yr_df[["item_id", "product", "date", "sensor"]].values,
+                    hovertemplate="%{customdata[3]} %{customdata[2]}<br>Snow: %{y:.1f}%<extra></extra>",
+                ))
+                crossed = crossings[crossings["status"] == "crossed"]
+                if len(crossed) > 0:
+                    fig_snow.add_trace(go.Scatter(
+                        x=crossed["crossing_date"], y=crossed["threshold"], mode="markers+text",
+                        name="Threshold crossing (interpolated)",
+                        marker=dict(size=10, symbol="x", color="#E74C3C"),
+                        text=[f"{t:.0f}%" for t in crossed["threshold"]], textposition="top center",
+                        hovertemplate="Crossed %{y:.0f}%% on %{x|%Y-%m-%d}<extra></extra>",
+                    ))
+                fig_snow.update_layout(
+                    yaxis_title="Snow cover (%)", xaxis_title="Date", height=460, yaxis=dict(range=[-2, 102]),
+                )
+                snow_event = st.plotly_chart(
+                    fig_snow, use_container_width=True, on_select="rerun",
+                    selection_mode=("points", "box", "lasso"), key="snow_chart",
+                )
+                snow_sel_points = []
+                if snow_event and snow_event.get("selection"):
+                    snow_sel_points = snow_event["selection"].get("points", [])
+                snow_sel_scenes = []
+                for pt in snow_sel_points:
+                    cd = pt.get("customdata")
+                    if cd and len(cd) >= 4:
+                        snow_sel_scenes.append(dict(item_id=cd[0], product=cd[1], date=cd[2], sensor=cd[3]))
+                render_scene_selection_actions(snow_sel_scenes, result, key_prefix="snowcover")
+
+                st.markdown(f"**Threshold crossings - {detail_year}**")
+                crossings_display = crossings.copy()
+                crossings_display["status"] = crossings_display["status"].map(
+                    lambda s: analysis.MELT_STATUS_LABELS.get(s, s)
+                )
+                for c in ("crossing_date", "before_date", "after_date"):
+                    crossings_display[c] = pd.to_datetime(crossings_display[c]).dt.date
+                st.dataframe(
+                    crossings_display.rename(columns={
+                        "threshold": "Threshold (%)", "crossing_date": "Crossing date", "status": "Status",
+                        "before_date": "Last obs. >= threshold", "before_pct": "...at snow % (before)",
+                        "after_date": "First obs. < threshold", "after_pct": "...at snow % (after)",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+                st.caption(
+                    f"NDSI snow threshold used at fetch time: {ndsi_threshold_used:.2f} (tab 2's "
+                    "'Advanced fetch options'). Crossing dates are linearly interpolated between the "
+                    "two bracketing scenes - melt timing between two widely-spaced scenes (e.g. a "
+                    "Landsat-only stretch) is less certain than between two closely-spaced ones; "
+                    "check the 'Last obs.'/'First obs.' columns above for how wide that gap is. Click "
+                    "or box-select points on the chart above to inspect a scene's actual snow-covered "
+                    "pixels below (via 'Add selected scene(s) to viewer', then the "
+                    f"'{SNOW_MASK_VIEW_LABEL}' display mode)."
+                )
+
         # ---- Multi-scene raster viewer ---------------------------------------
         # Up to MAX_VIEWED_SCENES scenes' rasters in memory here at once -
         # fetch_single_scene() re-fetches directly from DEA on demand (nothing
@@ -1083,9 +1470,18 @@ with tab_results:
             st.divider()
             st.subheader(f"Inspect scene(s) ({len(viewed_scenes)}/{MAX_VIEWED_SCENES})")
 
+            snow_pct_lookup = None
+            if "snow_pct_ndsi" in df_all.columns:
+                snow_pct_lookup = df_all.set_index(
+                    df_all["product"] + "::" + df_all["item_id"].astype(str)
+                )["snow_pct_ndsi"]
+
             for v in viewed_scenes:
                 vrow1, vrow2 = st.columns([5, 1])
-                vrow1.caption(f"{v['sensor']} {v['date']} ({v['key'].split('::', 1)[-1]})")
+                caption = f"{v['sensor']} {v['date']} ({v['key'].split('::', 1)[-1]})"
+                if snow_pct_lookup is not None and v["key"] in snow_pct_lookup.index:
+                    caption += f" — {float(snow_pct_lookup.loc[v['key']]):.0f}% snow (NDSI)"
+                vrow1.caption(caption)
                 if vrow2.button("Remove", key=f"remove_scene_{v['key']}"):
                     st.session_state.viewed_scenes = [
                         x for x in st.session_state.viewed_scenes if x["key"] != v["key"]
@@ -1098,7 +1494,8 @@ with tab_results:
             vmode_col, voutline_col = st.columns([3, 1])
             with vmode_col:
                 view_mode = st.radio(
-                    "Display", ["True colour", f"{METRIC_LABELS.get(metric, metric)} layer"],
+                    "Display",
+                    ["True colour", f"{METRIC_LABELS.get(metric, metric)} layer", SNOW_MASK_VIEW_LABEL],
                     horizontal=True, key="scene_view_mode",
                 )
             with voutline_col:
@@ -1130,6 +1527,12 @@ with tab_results:
                 "just the polygon itself. With more than one scene shown, use the layer control (top "
                 "right of the map) to toggle individual scenes."
             )
+            if view_mode == SNOW_MASK_VIEW_LABEL:
+                st.caption(
+                    "White = snow, blue = not snow, transparent = no valid NDSI pixel. Threshold: "
+                    f"NDSI > {result.fetch_params.get('ndsi_snow_threshold', analysis.DEFAULT_NDSI_SNOW_THRESHOLD):.2f} "
+                    "(set at fetch time, tab 2's 'Advanced fetch options')."
+                )
 
             scene_map = folium.Map(tiles=None, control_scale=True)
             satellite_tile_layer().add_to(scene_map)
@@ -1141,7 +1544,9 @@ with tab_results:
             # shown regardless of how many scenes are loaded. NDVI/NDSI
             # still use their fixed -1..1 range, same as elsewhere.
             shared_vmin, shared_vmax = None, None
-            if view_mode != "True colour":
+            if view_mode == SNOW_MASK_VIEW_LABEL:
+                shared_vmin, shared_vmax = 0.0, 1.0
+            elif view_mode != "True colour":
                 if metric in ("NDVI", "NDSI"):
                     shared_vmin, shared_vmax = -1.0, 1.0
                 else:
@@ -1173,6 +1578,26 @@ with tab_results:
                             if layer_out is not None:
                                 data_uri, bounds = layer_out
                                 download_arr, download_kind = cached["rgb"], "rgb"
+                    elif view_mode == SNOW_MASK_VIEW_LABEL:
+                        ndsi_arr = cached["metrics"].get("NDSI")
+                        if ndsi_arr is None:
+                            st.caption(f"No NDSI available for {vlabel} (e.g. missing green/SWIR band).")
+                        else:
+                            snow_threshold = result.fetch_params.get(
+                                "ndsi_snow_threshold", analysis.DEFAULT_NDSI_SNOW_THRESHOLD
+                            )
+                            snow_mask_arr = np.where(
+                                np.isfinite(ndsi_arr), (ndsi_arr > snow_threshold).astype("float32"), np.nan
+                            )
+                            layer_out = raster_viz.raster_overlay_layer(
+                                snow_mask_arr, cached["transform"], cached["crs"], "Snow-covered pixels",
+                                "Blues_r", vmin=0.0, vmax=1.0, opacity=raster_opacity / 100.0,
+                            )
+                            if layer_out is not None:
+                                data_uri, bounds, legend, _vmin, _vmax = layer_out
+                                download_arr, download_kind = snow_mask_arr, "snow_mask"
+                                if shared_legend is None:
+                                    shared_legend = legend
                     else:
                         arr = cached["metrics"].get(metric)
                         if arr is not None:
@@ -1246,6 +1671,16 @@ with tab_results:
                             with rasterio.open(tmp_path, "w", **profile) as dst:
                                 dst.write(out)
                             dl_label, dl_suffix = "true_colour", "rgb"
+                        elif download_kind == "snow_mask":
+                            out = np.where(np.isnan(download_arr), -9999.0, download_arr).astype("float32")
+                            profile = dict(
+                                driver="GTiff", height=out.shape[0], width=out.shape[1], count=1,
+                                dtype="float32", crs=crs, transform=transform,
+                                nodata=-9999.0, compress="lzw",
+                            )
+                            with rasterio.open(tmp_path, "w", **profile) as dst:
+                                dst.write(out, 1)
+                            dl_label, dl_suffix = "snow_mask", "snow_mask"
                         else:
                             out = np.where(np.isnan(download_arr), -9999.0, download_arr).astype("float32")
                             profile = dict(
