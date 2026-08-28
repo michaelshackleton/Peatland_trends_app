@@ -465,6 +465,15 @@ class AnalysisResult:
     products_json_path: str
     fetch_params: dict = field(default_factory=dict)  # what was asked for at fetch time, for display
     warnings: list = field(default_factory=list)
+    # product_code -> boolean 2D array (True = inside the polygon) on that
+    # product's grid - the same mask used to derive polygon_area_ha/
+    # polygon_total_px above, but kept as the actual array (not just its
+    # summary numbers) so tab 3's persistent-valid-fraction diagnostic can
+    # clip its map to the polygon's own interior instead of being
+    # dominated by the buffered background around it, which is NaN in
+    # every scene simply because it's outside the polygon, not because of
+    # any real cloud/shadow/footprint issue.
+    polygon_masks: dict = field(default_factory=dict)
 
 
 def run_analysis(
@@ -815,6 +824,7 @@ def run_analysis(
         target_crs=target_crs,
         polygon_area_ha=polygon_area_ha,
         polygon_total_px=polygon_total_px,
+        polygon_masks=polygon_masks,
         products_json_path=products_json_path,
         fetch_params=dict(
             start_date=start_date, end_date=end_date, product_codes=list(product_codes),
@@ -865,6 +875,172 @@ def _snow_pct_for_method(df: pd.DataFrame, snow_method: str) -> pd.Series:
             return (fmask_col + df["snow_pct_ndsi"]) / 2.0
         return fmask_col
     return fmask_col  # "fmask" (default)
+
+
+# Default snow-cover thresholds (%) for the melt-out date table/plot in tab
+# 3's "Snow cover & melt-out dates" section - a full ladder from fully
+# snow-covered down to bare, at a coarse enough step to be readable as both
+# a table and a set of reference markers on the seasonal plot.
+DEFAULT_MELT_THRESHOLDS = list(range(100, -1, -10))
+
+# "Melted out" for the headline single-date summary is defined as snow_pct
+# dropping to (or below) this value, not literally 0 - a handful of
+# NDSI-misclassified pixels (shadow, bright rock, a lingering wet patch)
+# can keep a genuinely bare polygon's snow_pct hovering just above zero for
+# the rest of the season, which would otherwise make "0%" never trigger, or
+# trigger absurdly late waiting for a perfectly clean scene. 5% is a
+# starting point, not a validated figure for these specific sites - exposed
+# as a tab 3 control so it can be tuned per polygon.
+DEFAULT_MELT_OUT_THRESHOLD_PCT = 5.0
+
+MELT_STATUS_LABELS = {
+    "crossed": "Crossed (interpolated date below)",
+    "not_reached": "Never reached this threshold",
+    "still_covered": "Still at/above this threshold at last observation",
+    "insufficient_data": "Fewer than 2 usable scenes this season",
+}
+
+
+def snow_threshold_crossings(
+    dates,
+    snow_pct,
+    thresholds: Optional[list] = None,
+    mode: str = "first",
+) -> pd.DataFrame:
+    """For one snow season's worth of (date, snow_pct) observations -
+    already restricted to a single melt season/year by the caller, e.g. one
+    calendar year's scenes filtered to the months snow can plausibly be
+    present (tab 3's "Snow season months" control) - finds, for each value
+    in `thresholds` (default DEFAULT_MELT_THRESHOLDS, 100 -> 0 in steps of
+    10), a date the polygon's snow % drops from at or above that threshold
+    to below it, linearly interpolating between the two bracketing
+    observations' dates in proportion to how far the true crossing point
+    sits between their snow_pct values. This is the core calculation
+    behind tab 3's "Snow cover & melt-out dates" section.
+
+    Real time series aren't perfectly monotonic - a late cold snap can
+    push snow_pct back up mid-melt, briefly re-crossing a threshold
+    upward before crossing back down again later - so `mode` controls
+    which downward crossing is reported when a threshold is crossed more
+    than once:
+    - "first" (default): the earliest downward crossing - useful for
+      "when did it first start dropping from this level", but can flag an
+      early, temporary partial-melt dip that later re-froze rather than
+      the season's real decline.
+    - "last": the latest downward crossing - the one immediately after
+      the *last* time the series was at/above this threshold, i.e. the
+      crossing tied to the final, sustained decline through that level.
+      This is what tab 3's "melt start"/"melt-out" dates use when the UI's
+      "last decline" option is selected, precisely to skip over an
+      earlier re-snow bounce and report the decline that actually stuck.
+    Both modes agree whenever a threshold is only crossed once (the
+    common case for a genuinely monotonic melt).
+
+    Returns a DataFrame, one row per threshold, with columns: threshold,
+    crossing_date (NaT if not applicable), status ("crossed" / "not_reached"
+    - snow_pct never got as high as this threshold at all, so there was
+    nothing to cross down through / "still_covered" - reached but never
+    dropped back below it by the last observation in the input, e.g. melt
+    was still in progress when the fetched data ends / "insufficient_data"
+    - fewer than two usable observations), and before_date/before_pct,
+    after_date/after_pct (the two bracketing observations for a "crossed"
+    row; NaT/NaN for every other status). See MELT_STATUS_LABELS for
+    display-ready text."""
+    if thresholds is None:
+        thresholds = DEFAULT_MELT_THRESHOLDS
+    if mode not in ("first", "last"):
+        raise ValueError(f"snow_threshold_crossings: mode must be 'first' or 'last', got {mode!r}")
+    d = pd.DataFrame({"date": pd.to_datetime(pd.Series(dates).values), "pct": pd.Series(snow_pct).values})
+    d = d.dropna(subset=["date", "pct"]).sort_values("date").reset_index(drop=True)
+
+    rows = []
+    if len(d) < 2:
+        for t in thresholds:
+            rows.append(dict(
+                threshold=t, crossing_date=pd.NaT, status="insufficient_data",
+                before_date=pd.NaT, before_pct=np.nan, after_date=pd.NaT, after_pct=np.nan,
+            ))
+        return pd.DataFrame(rows)
+
+    for t in thresholds:
+        crossing_date = pd.NaT
+        before_date = after_date = pd.NaT
+        before_pct = after_pct = np.nan
+        status = "not_reached" if d["pct"].max() < t else "still_covered"
+        if status == "still_covered":
+            candidates = [
+                i for i in range(len(d) - 1)
+                if float(d["pct"].iloc[i]) >= t > float(d["pct"].iloc[i + 1])
+            ]
+            if candidates:
+                i = candidates[0] if mode == "first" else candidates[-1]
+                p0, p1 = float(d["pct"].iloc[i]), float(d["pct"].iloc[i + 1])
+                d0, d1 = d["date"].iloc[i], d["date"].iloc[i + 1]
+                frac = (p0 - t) / (p0 - p1) if p0 != p1 else 0.0
+                crossing_date = d0 + (d1 - d0) * frac
+                before_date, before_pct = d0, p0
+                after_date, after_pct = d1, p1
+                status = "crossed"
+        rows.append(dict(
+            threshold=t, crossing_date=crossing_date, status=status,
+            before_date=before_date, before_pct=before_pct, after_date=after_date, after_pct=after_pct,
+        ))
+    return pd.DataFrame(rows)
+
+
+def persistent_valid_fraction(
+    scene_cache: dict, product_code: str, metric: str = "NDSI", polygon_mask: Optional[np.ndarray] = None,
+):
+    """Diagnostic for tab 3's "why is peak_snow_pct capped at the same
+    value every year" investigation. Stacks every cached scene's `metric`
+    array (NaN outside that metric's own valid-pixel mask - see
+    SceneCacheEntry.metrics) for one product, and returns, per pixel, the
+    fraction of those scenes where the pixel was valid: 0 means never
+    valid across the *entire* fetched time range regardless of weather -
+    a structurally excluded pixel (e.g. permanent terrain shadow fmask
+    keeps misclassifying as cloud shadow, or a strip of the polygon
+    outside the product's usable data footprint); 1 means always valid.
+    A pixel that's merely cloud-affected sometimes will sit somewhere in
+    between, not at 0.
+
+    `polygon_mask` (optional) - a boolean 2D array, True = inside the
+    polygon, on the same grid as the returned array (pass
+    AnalysisResult.polygon_masks.get(product_code)) - when given, every
+    pixel outside it is set to NaN in the returned array. Without this,
+    the buffered viewing area around a polygon (cropped for landscape
+    context, not clipped to the polygon's actual shape - see
+    SCENE_VIEW_BUFFER_M) reads as "never valid" too, since it's NaN in
+    every scene simply for being outside the polygon - which has nothing
+    to do with cloud/shadow/footprint quality and can visually swamp a
+    real, much smaller structural issue inside the polygon itself,
+    especially for a narrow/elongated polygon where the background vastly
+    outnumbers the polygon's own pixels.
+
+    Returns (freq_array, transform, crs, n_scenes_used) - freq_array is a
+    2D float32 array on that product's grid - or (None, None, None, 0) if
+    no cached scene has this metric/product (e.g. nothing was ever fetched
+    for it, or every scene's array had a mismatched shape)."""
+    arrays = []
+    transform = crs = None
+    ref_shape = None
+    for entry in scene_cache.values():
+        if entry.product_code != product_code:
+            continue
+        arr = entry.metrics.get(metric) if entry.metrics else None
+        if arr is None:
+            continue
+        if ref_shape is None:
+            ref_shape = arr.shape
+            transform, crs = entry.transform, entry.crs
+        if arr.shape != ref_shape:
+            continue
+        arrays.append(np.isfinite(arr))
+    if not arrays:
+        return None, None, None, 0
+    freq = np.stack(arrays).mean(axis=0).astype("float32")
+    if polygon_mask is not None and polygon_mask.shape == freq.shape:
+        freq = np.where(polygon_mask, freq, np.nan)
+    return freq, transform, crs, len(arrays)
 
 
 def filter_scene_df(
