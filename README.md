@@ -302,10 +302,12 @@ sounds:
 
 ## Is the live-filtering cache a memory problem on a server?
 
-Short answer: no, for the polygon sizes this app deals with. Only what
-tab 3 needs raster data for (the pixel-mean raster) is kept in memory, and
-the amount is small, bounded, and measured - it doesn't grow across a
-session, either, only per run.
+It can be, on Streamlit Community Cloud specifically - every visitor
+shares one process and one memory budget there (as of writing, roughly
+690MB-2.7GB), so a handful of concurrent sessions each holding a large
+polygon's cache can exhaust it. This bit a real deployment of this app
+(multiple reboots needed under normal multi-user load), which is why the
+mitigations below exist - not a hypothetical concern.
 
 - **What's kept, and why.** Only the mean raster genuinely needs per-pixel
   data after the fetch is over - the time series, phenology plot, and every
@@ -318,16 +320,37 @@ session, either, only per run.
   returns. `AnalysisResult.scene_cache` only ever holds each scene's small
   metric arrays (NDVI/TCB/TCG/TCW, plus NDSI wherever green/SWIR1 were
   available).
+- **Stored small: float16, and downsampled by default.** Cached metric
+  arrays are stored as `float16` (index values don't need more precision
+  than that) and, by default, block-mean downsampled by
+  `analysis.DEFAULT_RASTER_DOWNSAMPLE_FACTOR` (2, i.e. roughly a quarter
+  of native pixel count) before being cached - together, roughly an 8x
+  memory reduction per scene versus full-resolution float32. This only
+  affects the *cached* raster used for the pixel-mean map and tab 3's
+  instant re-filtering; `n_valid_px`/`pct_valid`/snow/cloud/smoke % and
+  the time-series/phenology stats are always computed from the
+  full-resolution data first (see `run_analysis()`'s per-scene loop), and
+  the single-scene viewer (`fetch_single_scene`) always re-fetches at full
+  resolution regardless. Tab 2 has a "Fetch at full sensor resolution"
+  checkbox for when the downsampled map isn't detailed enough - turning it
+  on (or off) after a polygon is already fetched clears that stale cache
+  immediately (it's at the wrong pixel grid to reuse) and prompts a
+  re-run, rather than silently mixing resolutions.
 - **How big, really.** Tab 2's summary panel reports the actual measured
   size of `AnalysisResult.scene_cache` (via `analysis.cache_size_bytes()`,
-  real `numpy.nbytes`, not an estimate) for the run you just did. For a
-  typical small peatland/fen polygon (tens to a few hundred pixels), even a
-  full 40-year, thousand-scene run lands in the single-digit megabytes - a
-  500-scene/400-pixel run measured around 3 MB with this cache design. It
-  scales with polygon size x scene count, so a much larger polygon or a
-  very long, high-frequency date range would use more - the reported
-  figure is there so you can see the real number for your own runs rather
-  than guessing.
+  real `numpy.nbytes`, not an estimate) for the run you just did, and a
+  rough pre-run estimate (`_estimate_cache_mb()` in `app.py`) gates a
+  confirmation warning before starting a request likely to exceed
+  `LARGE_REQUEST_WARN_MB` (300 MB) - both scale with polygon size x scene
+  count x downsample factor, so a much larger polygon or a very long,
+  high-frequency date range at full resolution can still use a lot more.
+  When prompted, breaking a long date range into a few shorter runs (e.g.
+  5-10 years at a time) keeps each individual cache smaller.
+- **"Clear cached results" button.** Sits next to tab 2's cache-size
+  caption once a result is loaded - frees the current session's cache
+  immediately (rather than waiting until you run a new polygon or your
+  session ends), for whenever you're done looking at a result but want to
+  keep the tab open.
 - **Viewing scenes costs nothing extra to the main cache.** Adding a scene
   to the viewer doesn't touch `scene_cache` at all - `fetch_single_scene()`
   re-fetches just that one scene from DEA on demand, and the app holds at
@@ -337,11 +360,19 @@ session, either, only per run.
   or starting a new analysis run, which clears the whole list.
 - **Per-session, not global.** Each user's cache lives in their own
   `st.session_state` and isn't shared. It gets replaced (the old result
-  becomes garbage-collectable) as soon as that user runs a new polygon or
-  reloads - it doesn't accumulate indefinitely within one session.
+  becomes garbage-collectable) as soon as that user runs a new polygon,
+  clears it manually, or reloads - it doesn't accumulate indefinitely
+  within one session.
 - **What matters for server hosting.** On a shared/multi-user deployment,
   total memory scales with concurrent active sessions x each one's cache
-  size, not with any single run in isolation.
+  size, not with any single run in isolation - this is exactly why the
+  per-run reductions above matter more on Community Cloud than they would
+  on a single-user local install. If the app still hits resource limits
+  under normal use, Streamlit offers free resource increases for
+  educational/nonprofit "good for the world" apps on a case-by-case basis
+  (see [this form](https://info.snowflake.com/streamlit-resource-increase-request.html)),
+  or the app can be moved to a non-shared host (Snowflake's managed
+  Streamlit hosting, or a self-hosted VM) for guaranteed resources.
 
 ## Deploying to Streamlit Community Cloud
 

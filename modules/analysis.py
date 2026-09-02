@@ -78,6 +78,7 @@ from typing import Callable, Optional
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from affine import Affine
 from rasterio.features import rasterize
 from shapely.geometry import box
 
@@ -158,6 +159,19 @@ SNOW_METHOD_LABELS = {
     "ndsi": "NDSI (green/SWIR index)",
     "mixture": "Mixture (average of both)",
 }
+
+# The single biggest driver of this app's memory footprint is
+# scene_cache: every fetched scene's full-resolution per-pixel metric
+# arrays, kept for the whole session so tab 3's quality filters/scene
+# exclusion can recompute the pixel-mean raster instantly without
+# re-fetching. On Streamlit Community Cloud every visitor shares one
+# process and one memory budget, so a handful of concurrent sessions each
+# holding a large polygon's full-resolution cache can exhaust it. Block-
+# mean downsampling what's stored (not what's used for quality-filter
+# stats, which stay full-resolution - see run_analysis()) trades spatial
+# detail in the pixel-mean raster map for a quadratic reduction in cache
+# size (factor=2 -> 1/4 the pixels, factor=4 -> 1/16). 1 disables it.
+DEFAULT_RASTER_DOWNSAMPLE_FACTOR = 2
 
 ProgressCB = Optional[Callable[[str, float], None]]
 
@@ -343,6 +357,41 @@ def _polygon_pixel_mask(roi_gdf_projected: gpd.GeoDataFrame, ref_da) -> np.ndarr
     return mask == 1
 
 
+def _downsample_mean(arr: np.ndarray, factor: int) -> np.ndarray:
+    """Block-mean downsample a 2D array by `factor` (e.g. 2 halves each
+    dimension, so the array has 1/4 the pixels) - NaN-aware, so a block is
+    NaN in the output only if every pixel in it is NaN. Any trailing
+    row/column that doesn't fill a whole block is dropped, and the array
+    is returned unchanged if it's too small in either dimension for even
+    one full block at this factor (rather than collapsing a tiny polygon
+    to a 0-pixel array). Pair with `_downsample_transform()` so the
+    returned array's geolocation stays correct."""
+    if factor <= 1:
+        return arr
+    h, w = arr.shape
+    h2, w2 = (h // factor) * factor, (w // factor) * factor
+    if h2 < factor or w2 < factor:
+        return arr
+    cropped = arr[:h2, :w2]
+    reshaped = cropped.reshape(h2 // factor, factor, w2 // factor, factor)
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(reshaped, axis=(1, 3))
+
+
+def _downsample_transform(transform, arr_shape: tuple, factor: int):
+    """The affine transform for `_downsample_mean(arr, factor)`'s output -
+    same top-left origin as `transform`, pixels `factor` times bigger. If
+    the array was too small to actually downsample (see
+    `_downsample_mean`'s guard), returns `transform` unchanged so the two
+    stay consistent with each other."""
+    if factor <= 1:
+        return transform
+    h, w = arr_shape
+    if (h // factor) * factor < factor or (w // factor) * factor < factor:
+        return transform
+    return transform * Affine.scale(factor)
+
+
 # fetch_single_scene()'s landscape-context buffer - see that function's
 # docstring for why this is a square rather than just the polygon's own
 # (often much smaller and more irregularly-shaped) bounding box padded out.
@@ -446,7 +495,7 @@ class SceneCacheEntry:
     # SceneCacheEntry don't hit an AttributeError.
     valid_mask: Optional[np.ndarray]   # bool, pm & non-nodata bands & fmask clear/water
     polygon_mask: Optional[np.ndarray]  # unused downstream; always None
-    metrics: dict             # metric name -> 2D float32 array (NaN outside valid_mask) - kept, needed by recompute_pixel_rasters
+    metrics: dict             # metric name -> 2D float16 array (NaN outside valid_mask), possibly block-mean downsampled (see DEFAULT_RASTER_DOWNSAMPLE_FACTOR) - kept, needed by recompute_pixel_rasters
     blue_dn: Optional[np.ndarray]  # raw (unscaled) blue band, for smoke detection
     transform: object
     crs: object
@@ -488,6 +537,7 @@ def run_analysis(
     smoke_threshold_dn: float = DEFAULT_SMOKE_THRESHOLD_DN,
     ndsi_snow_threshold: float = DEFAULT_NDSI_SNOW_THRESHOLD,
     batch_size: int = 15,
+    downsample_factor: int = DEFAULT_RASTER_DOWNSAMPLE_FACTOR,
     progress_cb: ProgressCB = None,
 ) -> AnalysisResult:
     """Fetches every scene from DEA (this is the only function in this
@@ -514,6 +564,16 @@ def run_analysis(
     is `ndsi_snow_threshold`: like `smoke_threshold_dn`, it's baked into
     scene_df's snow_pct_ndsi column at fetch time (not adjustable live),
     since it depends on a per-pixel NDSI array only kept transiently here.
+
+    `downsample_factor` (see its module-level docstring) block-mean
+    downsamples each scene's cached metric arrays before they're stored in
+    `scene_cache`, to keep the session's memory footprint down - it does
+    NOT affect n_valid_px/pct_valid/snow_pct/cloud_pct or any other
+    per-scene statistic in scene_df, which are always computed from the
+    full-resolution arrays first. Changing it for an already-fetched
+    polygon means the cached arrays are at the wrong resolution, so the
+    app clears and re-fetches rather than trying to reconcile the two -
+    see tab 2's resolution control.
 
     The STAC *search* itself (finding which scenes exist, before fetching
     any of their pixels) is done a few years at a time and retried on
@@ -659,6 +719,10 @@ def run_analysis(
             total_px = polygon_total_px[product_code]
             transform = processed.rio.transform()
             crs = processed.rio.crs
+            # The transform that actually describes what gets stored in
+            # scene_cache below (possibly downsampled) - see
+            # _downsample_transform()'s docstring.
+            cache_transform = _downsample_transform(transform, pm.shape, downsample_factor)
 
             # Map each STAC item's datetime (second precision) to its
             # metadata, so per-scene rows can be matched back up after
@@ -783,14 +847,28 @@ def run_analysis(
                 scene_rows.append(row)
 
                 if valid_px > 0 or valid_px_ndsi > 0:
+                    # row[f"{m}_mean"/"_std"] above are already computed from
+                    # the full-resolution arrays, so it's safe to shrink
+                    # `metrics` now, for what actually gets kept in
+                    # scene_cache for the rest of the session - block-mean
+                    # downsampled (see DEFAULT_RASTER_DOWNSAMPLE_FACTOR) and
+                    # stored as float16 rather than float64/float32, since
+                    # these are index values in roughly [-1, 1] that don't
+                    # need more precision than that for the pixel-mean
+                    # raster map they're used for.
+                    cached_metrics = {
+                        m: _downsample_mean(arr, downsample_factor).astype("float16")
+                        for m, arr in metrics.items()
+                        if arr is not None
+                    }
                     scene_cache[scene_key(product_code, item_id)] = SceneCacheEntry(
                         product_code=product_code,
                         item_id=item_id,
                         valid_mask=valid,        # released below, once smoke_pct is filled in
                         polygon_mask=None,       # never used downstream - not worth keeping
-                        metrics=metrics,
+                        metrics=cached_metrics,
                         blue_dn=raw_bands.get("blue"),  # released below, once smoke_pct is filled in
-                        transform=transform,
+                        transform=cache_transform,
                         crs=crs,
                     )
 
@@ -830,7 +908,7 @@ def run_analysis(
             start_date=start_date, end_date=end_date, product_codes=list(product_codes),
             max_cloud=max_cloud, min_coverage_pct=min_coverage_pct,
             smoke_threshold_dn=smoke_threshold_dn, ndsi_snow_threshold=ndsi_snow_threshold,
-            batch_size=batch_size,
+            batch_size=batch_size, downsample_factor=downsample_factor,
         ),
         warnings=warnings,
     )
@@ -1038,8 +1116,21 @@ def persistent_valid_fraction(
     if not arrays:
         return None, None, None, 0
     freq = np.stack(arrays).mean(axis=0).astype("float32")
-    if polygon_mask is not None and polygon_mask.shape == freq.shape:
-        freq = np.where(polygon_mask, freq, np.nan)
+    if polygon_mask is not None:
+        pm_for_freq = polygon_mask
+        # `polygon_mask` is always full-resolution (AnalysisResult.polygon_masks),
+        # but `freq` may be block-mean downsampled (see
+        # DEFAULT_RASTER_DOWNSAMPLE_FACTOR) - downsample the mask the same
+        # way (via "any pixel in the block was inside the polygon", the
+        # boolean analogue of block-mean) so the two still line up, rather
+        # than silently skipping the mask whenever downsampling is on.
+        if pm_for_freq.shape != freq.shape and freq.shape[0] > 0 and freq.shape[1] > 0:
+            factor_h = round(pm_for_freq.shape[0] / freq.shape[0])
+            factor_w = round(pm_for_freq.shape[1] / freq.shape[1])
+            if factor_h > 1 and factor_h == factor_w:
+                pm_for_freq = _downsample_mean(pm_for_freq.astype("float32"), factor_h) > 0
+        if pm_for_freq.shape == freq.shape:
+            freq = np.where(pm_for_freq, freq, np.nan)
     return freq, transform, crs, len(arrays)
 
 

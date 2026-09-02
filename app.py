@@ -72,6 +72,29 @@ SELECTED_COLOR = "#E74C3C"  # red
 LANDSAT_PIXEL_HA = (30 * 30) / 10000.0
 SENTINEL_PIXEL_HA = (10 * 10) / 10000.0
 
+# Rough scenes/year assumption (per product) used only for the pre-run
+# size warning below - not a real prediction (actual scene counts depend
+# heavily on cloud cover and the tile-coverage filter), just calibrated to
+# flag requests likely to produce an uncomfortably large in-memory scene
+# cache on this shared server. See _estimate_cache_mb().
+EST_SCENES_PER_YEAR_PER_PRODUCT = 25
+LARGE_REQUEST_WARN_MB = 300.0
+
+
+def _estimate_cache_mb(area_ha: float, start_date, end_date, n_products: int, downsample_factor: int) -> float:
+    """Rough upper-bound estimate (MB) of how big `result.scene_cache` will
+    end up, before actually fetching anything - used to warn the user
+    before a large run, not shown as a precise number anywhere. Assumes
+    worst case Sentinel-2 pixel size (finer than Landsat's), every metric
+    cached (see METRICS), and float16 storage - see
+    analysis.DEFAULT_RASTER_DOWNSAMPLE_FACTOR for what downsample_factor
+    does to this."""
+    date_span_years = max((end_date - start_date).days / 365.25, 0.0)
+    est_pixels = (area_ha / SENTINEL_PIXEL_HA) / max(downsample_factor, 1) ** 2
+    est_scenes = date_span_years * EST_SCENES_PER_YEAR_PER_PRODUCT * n_products
+    bytes_per_scene = est_pixels * len(METRICS) * 2  # float16 = 2 bytes/pixel
+    return (est_scenes * bytes_per_scene) / (1024 * 1024)
+
 # Tab 3's single-scene viewer: how many scenes' rasters can be held (and
 # layered on the same map) at once. Each is small (a buffered square around
 # a bog/fen-sized polygon, see analysis.SCENE_VIEW_TARGET_SIZE_M) so memory
@@ -302,6 +325,7 @@ def init_state():
         run_error=None,
         excluded_keys=set(),
         viewed_scenes=[],  # up to MAX_VIEWED_SCENES fetched scenes at a time - see tab 3's scene viewer
+        confirm_large_run=False,  # tab 2's "this request is large, are you sure?" gate - see _estimate_cache_mb
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -699,6 +723,42 @@ with tab_run:
         if not chosen_products:
             st.caption("Select at least one of Landsat / Sentinel-2 above to enable Run.")
 
+        st.markdown("**Cached raster resolution**")
+        full_res = st.checkbox(
+            "Fetch at full sensor resolution",
+            value=False, key="raster_full_res",
+            help="By default, each fetched scene's raster is block-averaged to about a quarter "
+            "of its native pixel count (half the width and height) before being cached for the "
+            "rest of this session - roughly a 4x memory saving. This only changes the "
+            "*cached* resolution used for the pixel-mean raster map and tab 3's instant "
+            "re-filtering; it never affects valid-pixel/snow/cloud percentages or the time "
+            "series/phenology stats, which are always computed from the full-resolution data "
+            "first, nor the single-scene viewer, which always fetches at full resolution. "
+            "Turning this on keeps full resolution in the cache instead, at roughly 4x the "
+            "memory cost per scene - only worth it if you need to see fine spatial detail in "
+            "the pixel-mean raster map itself, and best kept for smaller polygons/date ranges "
+            "given this app runs on a shared, memory-limited server.",
+        )
+        downsample_factor = 1 if full_res else analysis.DEFAULT_RASTER_DOWNSAMPLE_FACTOR
+
+        # If this polygon already has cached results but they were fetched
+        # at a different resolution than what's selected now, that cache is
+        # stale (wrong pixel grid) - drop it immediately to free the memory
+        # and prompt for a fresh run, rather than silently mixing
+        # resolutions or leaving two copies in memory at once.
+        cached_result = st.session_state.result
+        if (
+            cached_result is not None
+            and st.session_state.result_uid == sel["uid"]
+            and cached_result.fetch_params.get("downsample_factor") != downsample_factor
+        ):
+            st.session_state.result = None
+            st.info(
+                "Resolution setting changed since this polygon was last fetched - the previously "
+                "cached data has been cleared to free memory. Click 'Run analysis' below to "
+                "reload at the new resolution."
+            )
+
         with st.expander("Advanced fetch options", expanded=False):
             st.caption(
                 "These only affect what gets *fetched* from DEA. Data-quality filtering (valid-pixel %, "
@@ -750,7 +810,43 @@ with tab_run:
         if start_date > end_date:
             st.error("Start date must be before end date.")
 
-        if st.button("Run analysis", type="primary", disabled=not can_run):
+        est_cache_mb = _estimate_cache_mb(
+            sel["area_ha"], start_date, end_date, len(chosen_products), downsample_factor
+        )
+        is_large_request = est_cache_mb > LARGE_REQUEST_WARN_MB
+
+        run_clicked = st.button("Run analysis", type="primary", disabled=not can_run, key="run_analysis_btn")
+
+        do_run = False
+        if run_clicked:
+            if is_large_request:
+                st.session_state.confirm_large_run = True
+            else:
+                do_run = True
+
+        if st.session_state.confirm_large_run:
+            st.warning(
+                f"This polygon/date range (roughly est. {est_cache_mb:.0f} MB once cached) is large "
+                "enough that it could use a significant chunk of this app's shared server memory - "
+                "and since Streamlit Community Cloud runs every visitor in one shared process, a "
+                "big request here can slow the app down or even crash it for other users too. "
+                "Consider breaking this up into a few shorter date ranges (e.g. one run per 5-10 "
+                "years) and combining the results afterward, rather than fetching everything at "
+                "once. This is a rough estimate, not a hard limit - you're welcome to proceed "
+                "anyway if you're confident it's fine.",
+                icon="⚠️",
+            )
+            wc1, wc2 = st.columns(2)
+            with wc1:
+                if st.button("Run anyway", key="confirm_large_run_btn", type="primary"):
+                    do_run = True
+                    st.session_state.confirm_large_run = False
+            with wc2:
+                if st.button("Cancel", key="cancel_large_run_btn"):
+                    st.session_state.confirm_large_run = False
+
+        if do_run:
+            st.session_state.confirm_large_run = False
             progress_bar = st.progress(0.0)
             status_text = st.empty()
 
@@ -771,6 +867,7 @@ with tab_run:
                     smoke_threshold_dn=float(smoke_threshold_dn),
                     ndsi_snow_threshold=float(ndsi_snow_threshold),
                     batch_size=int(batch_size),
+                    downsample_factor=downsample_factor,
                     progress_cb=progress_cb,
                 )
                 st.session_state.result = result
@@ -809,14 +906,24 @@ with tab_run:
                 if diag_bits:
                     st.caption("Diagnostics: " + "; ".join(diag_bits) + ". Adjust quality filters for these live in tab 3.")
             cache_mb = analysis.cache_size_bytes(result) / (1024 * 1024)
-            st.caption(
-                f"In-memory scene cache for this run: {cache_mb:.2f} MB "
-                f"({n_scenes} scenes x this polygon's pixel footprint). This is what tab 3's live "
-                "filters/exclusion work from without re-fetching - it's held for as long as this "
-                "result stays in this browser session's memory, and is replaced (old data becomes "
-                "garbage-collectable) as soon as you run a new polygon. On a shared server, total "
-                "memory scales with concurrent sessions x each one's cache size, not with this run alone."
-            )
+            cc1, cc2 = st.columns([3, 1])
+            with cc1:
+                st.caption(
+                    f"In-memory scene cache for this run: {cache_mb:.2f} MB "
+                    f"({n_scenes} scenes x this polygon's pixel footprint{'' if downsample_factor <= 1 else f', downsampled {downsample_factor}x'}). "
+                    "This is what tab 3's live filters/exclusion work from without re-fetching - it's "
+                    "held for as long as this result stays in this browser session's memory, and is "
+                    "replaced (old data becomes garbage-collectable) as soon as you run a new polygon "
+                    "or click 'Clear cached results'. On a shared server, total memory scales with "
+                    "concurrent sessions x each one's cache size, not with this run alone."
+                )
+            with cc2:
+                if st.button("Clear cached results", key="clear_cached_result_btn", help="Frees this session's cached scene data now, rather than waiting until you switch polygons."):
+                    st.session_state.result = None
+                    st.session_state.result_uid = None
+                    st.session_state.excluded_keys = set()
+                    st.session_state.viewed_scenes = []
+                    st.rerun()
             if result.warnings:
                 with st.expander(f"{len(result.warnings)} warning(s) during this run", expanded=False):
                     for w in result.warnings:
