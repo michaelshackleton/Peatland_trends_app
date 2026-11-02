@@ -289,6 +289,27 @@ def render_scene_selection_actions(sel_scenes: list, result, key_prefix: str) ->
 
 st.set_page_config(page_title="Peatland Trend Analysis", layout="wide")
 
+# RCAAE logo (black artwork on a transparent background). Shown in the
+# top-left (sidebar/header) via st.logo on every tab; inverted to white in dark
+# mode so it doesn't vanish against a dark background. Skipped silently if
+# the file is missing so the app still loads.
+LOGO_PATH = os.path.join(BASE_DIR, "assets", "RCAAE_logo.png")
+if os.path.exists(LOGO_PATH):
+    st.logo(LOGO_PATH, size="large")
+    st.markdown(
+        """
+        <style>
+        /* st.logo's "large" is only ~1.5rem tall; bump it up. */
+        [data-testid="stLogo"] { height: 3rem; max-width: 100%; }
+        [data-testid="stSidebarHeader"] { height: 4.5rem; }
+        @media (prefers-color-scheme: dark) {
+            [data-testid="stLogo"] { filter: invert(1); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 # --------------------------------------------------------------------------
 # Data loading (cached)
